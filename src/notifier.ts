@@ -19,7 +19,7 @@ function enabled(): boolean {
   return Boolean(CONFIG.TELEGRAM_BOT_TOKEN && CONFIG.TELEGRAM_CHAT_ID);
 }
 
-async function send(text: string): Promise<void> {
+async function send(text: string, extra?: Record<string, unknown>): Promise<void> {
   if (!enabled()) return;
   try {
     const url = `https://api.telegram.org/bot${CONFIG.TELEGRAM_BOT_TOKEN}/sendMessage`;
@@ -31,6 +31,7 @@ async function send(text: string): Promise<void> {
         text,
         parse_mode: "HTML",
         disable_web_page_preview: true,
+        ...extra,
       }),
     });
     if (!res.ok) {
@@ -188,5 +189,38 @@ export function notifyLlmTighten(args: {
     `🤖 <b>LLM ${verb} ${escapeHtml(args.name)}</b>  ${icon} ${(args.oldTrailPct * 100).toFixed(0)}% → ${(args.newTrailPct * 100).toFixed(0)}%\n` +
     `<i>"${escapeHtml(args.reason)}"</i>\n` +
     `<a href="${gmgn(escapeHtml(args.mint))}">GMGN</a>`,
+  );
+}
+
+/**
+ * Milestone alert — fires when a position crosses a PnL-% threshold for the
+ * first time (e.g. +100%, +200%). Includes an inline sell button so the user
+ * can take profit in one tap directly from the notification.
+ */
+export function notifyMilestone(args: {
+  name: string;
+  mint: string;
+  milestonePct: number;      // the threshold crossed, e.g. 200 for +200%
+  currentPnlPct: number;     // actual current PnL (always >= milestonePct)
+  peakPnlPct: number;
+  entrySol: number;
+  unrealizedSol: number;     // current unrealized PnL in SOL
+}): Promise<void> {
+  const multiple = 1 + args.milestonePct / 100;            // e.g. 200% → 3x
+  const multipleStr = multiple >= 2 ? `${multiple.toFixed(multiple >= 10 ? 0 : 1)}x` : "";
+  const icon = multiple >= 10 ? "👑" : multiple >= 5 ? "💎" : multiple >= 3 ? "🌙" : "🚀";
+  const unrealized = args.unrealizedSol >= 0 ? "+" : "";
+  return send(
+    `${icon} <b>${escapeHtml(args.name)} hit +${args.milestonePct}%</b>${multipleStr ? `  (${multipleStr})` : ""}\n` +
+    `Now: +${args.currentPnlPct.toFixed(1)}%  |  Peak: +${args.peakPnlPct.toFixed(1)}%\n` +
+    `Unrealized: <b>${unrealized}${args.unrealizedSol.toFixed(4)} SOL</b>\n` +
+    `<a href="${gmgn(escapeHtml(args.mint))}">GMGN</a>`,
+    {
+      reply_markup: {
+        inline_keyboard: [[
+          { text: `🚨 Sell ${args.name}`, callback_data: `sell:${args.mint}` },
+        ]],
+      },
+    },
   );
 }

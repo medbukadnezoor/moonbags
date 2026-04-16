@@ -89,13 +89,15 @@ const SETTINGS_LABELS: Record<SettableKey, string> = {
   STOP_PCT:                 "🛑 Stop loss",
   MAX_HOLD_SECS:            "⏱ Max hold",
   LLM_EXIT_ENABLED:         "🧠 LLM advisor",
+  MILESTONES_ENABLED:       "🎯 Milestones",
+  MILESTONE_PCTS:           "🎯 Milestone %s",
 };
 
 async function sendSettingsMenu(chatId: number): Promise<void> {
   const keys = Object.keys(SETTABLE_SPECS) as SettableKey[];
   const lines = keys.map((k) => {
     const spec = SETTABLE_SPECS[k];
-    const v = (CONFIG as unknown as Record<string, unknown>)[k] as number | boolean;
+    const v = (CONFIG as unknown as Record<string, unknown>)[k] as number | boolean | number[];
     return `${SETTINGS_LABELS[k]}: <b>${spec.display(v)}</b>`;
   });
 
@@ -117,7 +119,7 @@ async function sendSettingsMenu(chatId: number): Promise<void> {
 
 async function promptForEdit(chatId: number, key: SettableKey): Promise<void> {
   const spec = SETTABLE_SPECS[key];
-  const current = (CONFIG as unknown as Record<string, unknown>)[key] as number | boolean;
+  const current = (CONFIG as unknown as Record<string, unknown>)[key] as number | boolean | number[];
   const hint =
     key === "ARM_PCT" || key === "TRAIL_PCT" || key === "STOP_PCT"
       ? `(decimal — e.g. 0.55 for 55%)`
@@ -125,7 +127,9 @@ async function promptForEdit(chatId: number, key: SettableKey): Promise<void> {
         ? `(SOL — e.g. 0.05)`
         : key === "MAX_HOLD_SECS"
           ? `(seconds — e.g. 3600 for 1h)`
-          : "";
+          : key === "MILESTONE_PCTS"
+            ? `(comma-separated % — e.g. 100,200,500,1000 for +100% +200% +500% +1000%)`
+            : "";
 
   const resp = await tgPost("sendMessage", {
     chat_id: chatId,

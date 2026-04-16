@@ -34,6 +34,18 @@ function str(name: string): string | undefined {
   return raw;
 }
 
+/**
+ * Parse a comma-separated list of positive numbers from an env var.
+ * E.g. "100,200,500,1000" → [100, 200, 500, 1000].
+ * Invalid values are dropped silently; returns `fallback` on fully empty/invalid input.
+ */
+function numList(name: string, fallback: number[]): number[] {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parts = raw.split(",").map((s) => Number(s.trim())).filter((n) => Number.isFinite(n) && n > 0);
+  return parts.length > 0 ? parts.sort((a, b) => a - b) : fallback;
+}
+
 function resolveRpcUrl(): string {
   const raw = process.env.RPC_URL ?? "https://beta.helius-rpc.com?api-key=${HELIUS_API_KEY}";
   const helius = process.env.HELIUS_API_KEY ?? "";
@@ -99,6 +111,11 @@ export const CONFIG = ({
   TELEGRAM_CHAT_ID: str("TELEGRAM_CHAT_ID") ?? "",
   LLM_EXIT_ENABLED: bool("LLM_EXIT_ENABLED", false),
   MINIMAX_API_KEY: str("MINIMAX_API_KEY") ?? "",
+  // Milestone alerts — when a position crosses one of these PnL % thresholds
+  // on its way up, send a Telegram notification with a force-sell button.
+  // Default [100, 200, 500, 1000] = 2x / 3x / 6x / 11x.
+  MILESTONES_ENABLED: bool("MILESTONES_ENABLED", true),
+  MILESTONE_PCTS: numList("MILESTONE_PCTS", [100, 200, 500, 1000]),
   DRY_RUN,
 });
 
@@ -116,13 +133,17 @@ export type SettableKey =
   | "TRAIL_PCT"
   | "STOP_PCT"
   | "MAX_HOLD_SECS"
-  | "LLM_EXIT_ENABLED";
+  | "LLM_EXIT_ENABLED"
+  | "MILESTONES_ENABLED"
+  | "MILESTONE_PCTS";
 
-type Validator = (v: number | boolean) => string | null; // returns error msg or null
+export type SettableValue = number | boolean | number[];
+
+type Validator = (v: SettableValue) => string | null; // returns error msg or null
 type Spec = {
-  type: "number" | "boolean";
+  type: "number" | "boolean" | "numlist";
   validate: Validator;
-  display: (v: number | boolean) => string;
+  display: (v: SettableValue) => string;
 };
 
 export const SETTABLE_SPECS: Record<SettableKey, Spec> = {
@@ -172,6 +193,27 @@ export const SETTABLE_SPECS: Record<SettableKey, Spec> = {
     validate: (v) => (typeof v === "boolean" ? null : "must be true/false"),
     display: (v) => (v ? "🤖 ON" : "⚪️ OFF"),
   },
+  MILESTONES_ENABLED: {
+    type: "boolean",
+    validate: (v) => (typeof v === "boolean" ? null : "must be true/false"),
+    display: (v) => (v ? "🎯 ON" : "⚪️ OFF"),
+  },
+  MILESTONE_PCTS: {
+    type: "numlist",
+    validate: (v) => {
+      if (!Array.isArray(v)) return "must be a comma-separated list of positive numbers";
+      if (v.length === 0) return "at least one milestone required";
+      if (v.length > 10) return "max 10 milestones";
+      if (v.some((n) => typeof n !== "number" || !Number.isFinite(n) || n <= 0 || n > 100000)) {
+        return "each milestone must be a positive number (1 – 100000)";
+      }
+      return null;
+    },
+    display: (v) => {
+      const arr = v as number[];
+      return arr.map((n) => `+${n}%`).join(", ");
+    },
+  },
 };
 
 export type SetConfigResult = { ok: true } | { ok: false; error: string };
@@ -195,16 +237,21 @@ function persistEnv(key: string, value: string): void {
 
 export function setConfigValue(key: SettableKey, raw: string): SetConfigResult {
   const spec = SETTABLE_SPECS[key];
-  let parsed: number | boolean;
+  let parsed: SettableValue;
   if (spec.type === "number") {
     const n = Number(raw);
     if (!Number.isFinite(n)) return { ok: false, error: "not a valid number" };
     parsed = n;
-  } else {
+  } else if (spec.type === "boolean") {
     const v = raw.trim().toLowerCase();
     if (["1", "true", "yes", "y", "on"].includes(v)) parsed = true;
     else if (["0", "false", "no", "n", "off"].includes(v)) parsed = false;
     else return { ok: false, error: "must be true/false" };
+  } else {
+    // numlist — comma-separated positive numbers
+    const parts = raw.split(",").map((s) => Number(s.trim())).filter((n) => Number.isFinite(n));
+    if (parts.length === 0) return { ok: false, error: "no valid numbers in list" };
+    parsed = parts.sort((a, b) => a - b);
   }
   const err = spec.validate(parsed);
   if (err) return { ok: false, error: err };
@@ -213,7 +260,8 @@ export function setConfigValue(key: SettableKey, raw: string): SetConfigResult {
   (CONFIG as unknown as Record<string, unknown>)[key] = parsed;
   // persist to .env so the change survives restart
   try {
-    persistEnv(key, String(parsed));
+    const envValue = Array.isArray(parsed) ? parsed.join(",") : String(parsed);
+    persistEnv(key, envValue);
   } catch (e) {
     return { ok: false, error: `wrote in-memory but .env persist failed: ${(e as Error).message}` };
   }

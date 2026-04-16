@@ -5,7 +5,7 @@ import { CONFIG, SOL_MINT } from "./config.js";
 import logger from "./logger.js";
 import { buyTokenWithSol, sellTokenForSol, getWalletTokenBalance, unwrapResidualWsol } from "./jupClient.js";
 import { getBatchPricesParallel, getPriceViaSellQuote } from "./priceFeed.js";
-import { notifyBuy, notifyBuyFail, notifySell, notifySellFail, notifyArmed, notifyMoonbagStart, notifyLlmActive, notifyLlmTighten } from "./notifier.js";
+import { notifyBuy, notifyBuyFail, notifySell, notifySellFail, notifyArmed, notifyMoonbagStart, notifyLlmActive, notifyLlmTighten, notifyMilestone } from "./notifier.js";
 import { consultLlm, type LlmContext } from "./llmExitAdvisor.js";
 import { getPositionSnapshot } from "./okxClient.js";
 import {
@@ -432,6 +432,38 @@ async function tickOne(
     markDirty();
     logger.info({ mint: position.mint, pnlPct }, "armed trailing");
     void notifyArmed({ name: position.name, mint: position.mint, pnlPct });
+  }
+
+  // Milestone alerts — fire a Telegram notification (with inline sell button)
+  // the first time a position crosses each configured PnL threshold on its
+  // way UP. Dedupe via position.milestonesHit so each fires at most once.
+  if (CONFIG.MILESTONES_ENABLED && pnlPct > 0 && CONFIG.MILESTONE_PCTS.length > 0) {
+    const pnlPctWhole = pnlPct * 100;
+    const peakPnlPct = (position.peakPricePerTokenSol / entry - 1) * 100;
+    const hit = position.milestonesHit ?? [];
+    let dirty = false;
+    for (const milestone of CONFIG.MILESTONE_PCTS) {
+      if (pnlPctWhole >= milestone && !hit.includes(milestone)) {
+        hit.push(milestone);
+        dirty = true;
+        const currentSolValue = position.entrySolSpent * (currentPriceSol / entry);
+        const unrealizedSol = currentSolValue - position.entrySolSpent;
+        void notifyMilestone({
+          name: position.name,
+          mint: position.mint,
+          milestonePct: milestone,
+          currentPnlPct: pnlPctWhole,
+          peakPnlPct,
+          entrySol: position.entrySolSpent,
+          unrealizedSol,
+        });
+        logger.info({ mint: position.mint, milestone, pnlPct: pnlPctWhole }, "milestone hit");
+      }
+    }
+    if (dirty) {
+      position.milestonesHit = hit;
+      markDirty();
+    }
   }
 
   // Effective trail: LLM may override CONFIG.TRAIL_PCT via dynamicTrailPct
