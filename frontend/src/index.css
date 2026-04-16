@@ -1,0 +1,62 @@
+@import url("https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@500;700&display=swap");
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+html, body, #root {
+  height: 100%;
+  color: hsl(48 19% 92%);
+  font-family: Inter, ui-sans-serif, system-ui;
+  /* Subtle space gradient — gives the bottom of the screen a slight Earth/atmosphere glow */
+  background:
+    radial-gradient(ellipse at 50% 110%, hsla(202 80% 54% / 0.10) 0%, transparent 55%),
+    radial-gradient(ellipse at 80% -10%, hsla(89 53% 44% / 0.06) 0%, transparent 50%),
+    hsl(232 17% 6%);
+  background-attachment: fixed;
+}
+
+/* Star field — tiny twinkling dots scattered across the page background */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background-image:
+    radial-gradient(1px 1px at 20% 30%, hsl(48 19% 92% / 0.5), transparent 50%),
+    radial-gradient(1px 1px at 70% 80%, hsl(48 19% 92% / 0.4), transparent 50%),
+    radial-gradient(1px 1px at 40% 60%, hsl(48 19% 92% / 0.6), transparent 50%),
+    radial-gradient(1px 1px at 90% 20%, hsl(48 19% 92% / 0.4), transparent 50%),
+    radial-gradient(1px 1px at 15% 80%, hsl(48 19% 92% / 0.3), transparent 50%),
+    radial-gradient(1px 1px at 85% 45%, hsl(48 19% 92% / 0.5), transparent 50%),
+    radial-gradient(1px 1px at 55% 15%, hsl(48 19% 92% / 0.4), transparent 50%),
+    radial-gradient(1px 1px at 30% 90%, hsl(48 19% 92% / 0.3), transparent 50%);
+  background-size: 200% 200%;
+  opacity: 0.6;
+}
+
+#root { position: relative; z-index: 1; }
+
+/* Stitch helpers ---------------------------------------------------------- */
+
+/* Larger field of stars — used as a fixed full-page backdrop element */
+.star-field {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background-image: radial-gradient(white, rgba(255, 255, 255, 0.2) 1px, transparent 40px);
+  background-size: 200px 200px;
+  opacity: 0.05;
+  z-index: -1;
+  pointer-events: none;
+}
+
+/* Soft Pepe-green halo behind the hero number */
+.pepe-glow {
+  background: radial-gradient(circle at center, rgba(150, 217, 93, 0.10) 0%, transparent 70%);
+}
+
+/* Hide scrollbar utility for the bottom strip */
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { scrollbar-width: none; }

@@ -1,0 +1,229 @@
+import dotenv from "dotenv";
+import { readFileSync, writeFileSync } from "node:fs";
+import path from "node:path";
+
+dotenv.config();
+
+const ENV_FILE = path.resolve(".env");
+
+export const SOL_MINT = "So11111111111111111111111111111111111111112";
+export const JUP_BASE = "https://api.jup.ag/ultra/v1";
+
+function num(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) {
+    throw new Error(`Invalid number for env var ${name}: ${raw}`);
+  }
+  return parsed;
+}
+
+function bool(name: string, fallback: boolean): boolean {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const v = raw.trim().toLowerCase();
+  if (["1", "true", "yes", "y", "on"].includes(v)) return true;
+  if (["0", "false", "no", "n", "off"].includes(v)) return false;
+  throw new Error(`Invalid boolean for env var ${name}: ${raw}`);
+}
+
+function str(name: string): string | undefined {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return undefined;
+  return raw;
+}
+
+function resolveRpcUrl(): string {
+  const raw = process.env.RPC_URL ?? "https://beta.helius-rpc.com?api-key=${HELIUS_API_KEY}";
+  const helius = process.env.HELIUS_API_KEY ?? "";
+  return raw.replace("${HELIUS_API_KEY}", helius);
+}
+
+const DRY_RUN = bool("DRY_RUN", true);
+
+const JUP_API_KEY = str("JUP_API_KEY");
+const HELIUS_API_KEY = str("HELIUS_API_KEY");
+const PRIV_B58 = str("PRIV_B58");
+
+const missing: string[] = [];
+if (!JUP_API_KEY) missing.push("JUP_API_KEY");
+if (!HELIUS_API_KEY) missing.push("HELIUS_API_KEY");
+if (!PRIV_B58) missing.push("PRIV_B58");
+
+if (missing.length > 0) {
+  if (DRY_RUN && missing.length === 1 && missing[0] === "PRIV_B58") {
+    console.warn("[config] DRY_RUN=true and PRIV_B58 missing — continuing without a signing key.");
+  } else if (DRY_RUN && missing.every((m) => m === "PRIV_B58")) {
+    console.warn("[config] DRY_RUN=true and PRIV_B58 missing — continuing without a signing key.");
+  } else {
+    const hardMissing = missing.filter((m) => !(DRY_RUN && m === "PRIV_B58"));
+    if (hardMissing.length > 0) {
+      throw new Error(`Missing required env vars: ${hardMissing.join(", ")}`);
+    } else {
+      console.warn("[config] DRY_RUN=true and PRIV_B58 missing — continuing without a signing key.");
+    }
+  }
+}
+
+// CONFIG is mutable so /settings in the Telegram bot can update values live.
+// API keys, wallet keys, and DRY_RUN are still NOT mutable via the in-process
+// updater (see SETTABLE_KEYS below). Direct file edits + restart are required
+// for those.
+export const CONFIG = ({
+  JUP_API_KEY: JUP_API_KEY ?? "",
+  HELIUS_API_KEY: HELIUS_API_KEY ?? "",
+  PRIV_B58: PRIV_B58 ?? "",
+  RPC_URL: resolveRpcUrl(),
+  BUY_SIZE_SOL: num("BUY_SIZE_SOL", 0.01),
+  MAX_CONCURRENT_POSITIONS: num("MAX_CONCURRENT_POSITIONS", 3),
+  ARM_PCT: num("ARM_PCT", 0.5),
+  TRAIL_PCT: num("TRAIL_PCT", 0.2),
+  STOP_PCT: num("STOP_PCT", 0.3),
+  MAX_HOLD_SECS: num("MAX_HOLD_SECS", 1800),
+  MAX_ALERT_AGE_MINS: num("MAX_ALERT_AGE_MINS", 5),
+  MIN_LIQUIDITY_USD: num("MIN_LIQUIDITY_USD", 5000),
+  MIN_SCORE: num("MIN_SCORE", 75),
+  MAX_RUG_RATIO: num("MAX_RUG_RATIO", 0),
+  MAX_BUNDLER_PCT: num("MAX_BUNDLER_PCT", 0),
+  MAX_TOP10_PCT: num("MAX_TOP10_PCT", 0),
+  REQUIRE_RISING_LIQ: bool("REQUIRE_RISING_LIQ", false),
+  SCG_POLL_MS: num("SCG_POLL_MS", 3000),
+  PRICE_POLL_MS: num("PRICE_POLL_MS", 2000),
+  SLIPPAGE_BPS: num("SLIPPAGE_BPS", 0), // unused with Ultra (automatic slippage via RTSE)
+  MOONBAG_PCT: num("MOONBAG_PCT", 0),
+  MB_TRAIL_PCT: num("MB_TRAIL_PCT", 0.60),
+  MB_TIMEOUT_SECS: num("MB_TIMEOUT_SECS", 7200),
+  DASHBOARD_PORT: num("DASHBOARD_PORT", 8787),
+  TELEGRAM_BOT_TOKEN: str("TELEGRAM_BOT_TOKEN") ?? "",
+  TELEGRAM_CHAT_ID: str("TELEGRAM_CHAT_ID") ?? "",
+  LLM_EXIT_ENABLED: bool("LLM_EXIT_ENABLED", false),
+  MINIMAX_API_KEY: str("MINIMAX_API_KEY") ?? "",
+  DRY_RUN,
+});
+
+export type Config = typeof CONFIG;
+
+// ---------------------------------------------------------------------------
+// Runtime config editing (used by Telegram /settings menu).
+// Only whitelisted keys can be modified at runtime — API keys, wallet keys,
+// RPC URLs, and DRY_RUN are intentionally excluded from live editing.
+// ---------------------------------------------------------------------------
+export type SettableKey =
+  | "BUY_SIZE_SOL"
+  | "MAX_CONCURRENT_POSITIONS"
+  | "ARM_PCT"
+  | "TRAIL_PCT"
+  | "STOP_PCT"
+  | "MAX_HOLD_SECS"
+  | "LLM_EXIT_ENABLED";
+
+type Validator = (v: number | boolean) => string | null; // returns error msg or null
+type Spec = {
+  type: "number" | "boolean";
+  validate: Validator;
+  display: (v: number | boolean) => string;
+};
+
+export const SETTABLE_SPECS: Record<SettableKey, Spec> = {
+  BUY_SIZE_SOL: {
+    type: "number",
+    validate: (v) => (typeof v === "number" && v >= 0.001 && v <= 1.0 ? null : "must be 0.001 – 1.0 SOL"),
+    display: (v) => `${(v as number).toString()} SOL`,
+  },
+  MAX_CONCURRENT_POSITIONS: {
+    type: "number",
+    validate: (v) =>
+      typeof v === "number" && Number.isInteger(v) && v >= 1 && v <= 50
+        ? null
+        : "must be an integer 1 – 50",
+    display: (v) => `${v}`,
+  },
+  ARM_PCT: {
+    type: "number",
+    validate: (v) => (typeof v === "number" && v >= 0.05 && v <= 5.0 ? null : "must be 0.05 – 5.0 (5% – 500%)"),
+    display: (v) => `${((v as number) * 100).toFixed(0)}%`,
+  },
+  TRAIL_PCT: {
+    type: "number",
+    validate: (v) => (typeof v === "number" && v >= 0.05 && v <= 5.0 ? null : "must be 0.05 – 5.0 (5% – 500%)"),
+    display: (v) => `${((v as number) * 100).toFixed(0)}%`,
+  },
+  STOP_PCT: {
+    type: "number",
+    validate: (v) => (typeof v === "number" && v >= 0.05 && v <= 5.0 ? null : "must be 0.05 – 5.0 (5% – 500%)"),
+    display: (v) => `${((v as number) * 100).toFixed(0)}%`,
+  },
+  MAX_HOLD_SECS: {
+    type: "number",
+    validate: (v) =>
+      typeof v === "number" && Number.isFinite(v) && v >= 60 ? null : "must be ≥ 60 seconds",
+    display: (v) => {
+      const n = v as number;
+      if (n >= 99_999_999) return "∞";
+      if (n >= 86400) return `${(n / 86400).toFixed(1)}d`;
+      if (n >= 3600) return `${(n / 3600).toFixed(1)}h`;
+      if (n >= 60) return `${Math.round(n / 60)}m`;
+      return `${n}s`;
+    },
+  },
+  LLM_EXIT_ENABLED: {
+    type: "boolean",
+    validate: (v) => (typeof v === "boolean" ? null : "must be true/false"),
+    display: (v) => (v ? "🤖 ON" : "⚪️ OFF"),
+  },
+};
+
+export type SetConfigResult = { ok: true } | { ok: false; error: string };
+
+function persistEnv(key: string, value: string): void {
+  let content: string;
+  try {
+    content = readFileSync(ENV_FILE, "utf8");
+  } catch {
+    content = "";
+  }
+  const line = `${key}=${value}`;
+  const re = new RegExp(`^${key}=.*$`, "m");
+  if (re.test(content)) {
+    content = content.replace(re, line);
+  } else {
+    content = content.endsWith("\n") || content === "" ? content + line + "\n" : content + "\n" + line + "\n";
+  }
+  writeFileSync(ENV_FILE, content);
+}
+
+export function setConfigValue(key: SettableKey, raw: string): SetConfigResult {
+  const spec = SETTABLE_SPECS[key];
+  let parsed: number | boolean;
+  if (spec.type === "number") {
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return { ok: false, error: "not a valid number" };
+    parsed = n;
+  } else {
+    const v = raw.trim().toLowerCase();
+    if (["1", "true", "yes", "y", "on"].includes(v)) parsed = true;
+    else if (["0", "false", "no", "n", "off"].includes(v)) parsed = false;
+    else return { ok: false, error: "must be true/false" };
+  }
+  const err = spec.validate(parsed);
+  if (err) return { ok: false, error: err };
+
+  // mutate in-memory CONFIG (typed as readonly but the object isn't frozen anymore)
+  (CONFIG as unknown as Record<string, unknown>)[key] = parsed;
+  // persist to .env so the change survives restart
+  try {
+    persistEnv(key, String(parsed));
+  } catch (e) {
+    return { ok: false, error: `wrote in-memory but .env persist failed: ${(e as Error).message}` };
+  }
+  return { ok: true };
+}
+
+export function toggleConfigValue(key: SettableKey): SetConfigResult {
+  if (SETTABLE_SPECS[key].type !== "boolean") {
+    return { ok: false, error: "not a boolean setting" };
+  }
+  const current = (CONFIG as unknown as Record<string, unknown>)[key] as boolean;
+  return setConfigValue(key, String(!current));
+}

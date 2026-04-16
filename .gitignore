@@ -1,0 +1,31 @@
+# === Secrets / runtime state ===
+.env
+.env.backup.*
+moonbags-keypair.json
+state/
+logs/
+*.log
+
+# === Build artifacts ===
+node_modules/
+frontend/node_modules/
+frontend/dist/
+public/assets/
+public/index.html
+*.tsbuildinfo
+dist/
+
+# === Dev-time data ===
+backtest_*.csv
+
+# === Editor / OS ===
+.DS_Store
+.vscode/
+.idea/
+.claude/
+.stitch/
+.playwright-mcp/
+
+# === Screenshots / ad-hoc captures ===
+*.png
+!docs/**/*.png
