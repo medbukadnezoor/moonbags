@@ -45,9 +45,12 @@ import {
 // Public types
 // ---------------------------------------------------------------------------
 export type LlmDecision = {
-  action: "hold" | "exit_now" | "set_trail";
+  action: "hold" | "exit_now" | "set_trail" | "partial_exit";
   reason: string;
   newTrailPct?: number;
+  // For partial_exit: fraction of CURRENT tokensHeld to sell (0.10 – 0.75).
+  // The remaining position stays open with its existing trail/stop/LLM coverage.
+  sellPct?: number;
 };
 
 export type LlmContext = {
@@ -114,13 +117,17 @@ Position prices (entryPriceSol/currentPriceSol) are denominated in SOL per
 token. The token's USD price lives in snapshot.momentum.priceUsd. Do not
 compare these directly without converting.
 
-Your job is to choose ONE of three actions:
-  - "hold"       — leave the existing trailing stop alone
-  - "set_trail"  — change the trail % in either direction. new_trail_pct must
-                   be in (0, ceilingTrailPctDecimal]. Use this to tighten when
-                   warranted, or LOOSEN (up to the ceiling) if a prior tighten
-                   looks premature now.
-  - "exit_now"   — sell the entire position immediately
+Your job is to choose ONE of four actions:
+  - "hold"          — leave the existing trailing stop alone
+  - "set_trail"     — change the trail % in either direction. new_trail_pct must
+                      be in (0, ceilingTrailPctDecimal]. Use this to tighten when
+                      warranted, or LOOSEN (up to the ceiling) if a prior tighten
+                      looks premature now.
+  - "partial_exit"  — sell a FRACTION (sell_pct in [0.10, 0.75]) of CURRENT
+                      tokensHeld NOW. The remaining position stays open and
+                      keeps running with existing trail/stop. Use to lock profit
+                      on a runner while staying exposed for more upside.
+  - "exit_now"      — sell the entire position immediately
 
 EXIT PHILOSOPHY — DEFAULT ACTION IS HOLD.
 
@@ -168,6 +175,25 @@ Constraints on set_trail:
     than current (larger, up to ceiling) to undo a premature tighten.
   - If you can't justify a number different from the current trail, use "hold".
 
+When to use partial_exit (the runner-capture tool):
+  - The position has run significantly (peakPnlPct > +100%) AND you see
+    MIXED signals — not enough convergence to exit_now, but a real
+    deceleration / distribution worth de-risking.
+  - Smart money slowing (not flipping to net-sell) → sell 0.20-0.30 to
+    lock profit, hold remainder for continuation.
+  - Token establishing a base at a new high → sell 0.25-0.40, let the rest
+    ride for a potential V2 leg.
+  - Bundlers starting to distribute but dev still holding/buying → sell
+    0.30-0.50 to rebalance risk.
+  - DO NOT use partial_exit for panic. If convergence fires (≥3 bearish
+    signals), use exit_now (full exit) — partial exits on dying tokens
+    just delay the inevitable loss.
+  - DO NOT use partial_exit below +100% peak PnL — too early to scale out.
+  - Typical sell_pct values: 0.20 – 0.50. For 0.75+, use exit_now.
+  - You CAN fire partial_exit multiple times on the same position as it
+    runs (e.g. 0.25 at +200%, another 0.25 at +500%, keep ~50% for the moon).
+    But wait for meaningful price progress between partials — not every poll.
+
 Output: you MUST respond by calling the submit_decision tool. Do not write
 prose. The "reason" field is shown to the user in Telegram — keep it to
 1-2 sentences and reference the specific on-chain cue you used.`;
@@ -186,9 +212,9 @@ const SUBMIT_DECISION_TOOL = {
       properties: {
         action: {
           type: "string",
-          enum: ["hold", "exit_now", "set_trail"],
+          enum: ["hold", "exit_now", "set_trail", "partial_exit"],
           description:
-            "hold = keep existing trail; exit_now = sell entire position immediately; set_trail = change the trail % (tighter or looser, capped at ceilingTrailPctDecimal).",
+            "hold = keep existing trail; exit_now = sell entire position immediately; set_trail = change the trail % (tighter or looser, capped at ceilingTrailPctDecimal); partial_exit = sell a fraction (sell_pct) NOW and keep the rest running.",
         },
         reason: {
           type: "string",
@@ -199,6 +225,11 @@ const SUBMIT_DECISION_TOOL = {
           type: "number",
           description:
             "REQUIRED only when action = set_trail. Decimal in (0, ceilingTrailPctDecimal], e.g. 0.20 for a 20% trail. May be tighter OR looser than the current trail, but never above the ceiling.",
+        },
+        sell_pct: {
+          type: "number",
+          description:
+            "REQUIRED only when action = partial_exit. Decimal in [0.10, 0.75]: fraction of CURRENT tokensHeld to sell. The remaining position stays open and keeps running. For >0.75, use exit_now instead. Typical values: 0.25-0.50 to lock profit on a running winner.",
         },
       },
       required: ["action", "reason"],
@@ -542,7 +573,7 @@ function parseDecision(
     return null;
   }
 
-  let args: { action?: string; reason?: string; new_trail_pct?: number };
+  let args: { action?: string; reason?: string; new_trail_pct?: number; sell_pct?: number };
   try {
     args = JSON.parse(call.function.arguments) as typeof args;
   } catch (err) {
@@ -584,6 +615,19 @@ function parseDecision(
       return null;
     }
     return { action, reason, newTrailPct };
+  }
+  if (action === "partial_exit") {
+    const sellPct = Number(args.sell_pct);
+    // Reject values outside the allowed band. For >0.75 the LLM should use
+    // exit_now instead (closer to full exit is cleaner than multi-step near-total sells).
+    if (!Number.isFinite(sellPct) || sellPct < 0.10 || sellPct > 0.75) {
+      logger.warn(
+        { sellPct },
+        "[llm] partial_exit with invalid sell_pct (must be in [0.10, 0.75])",
+      );
+      return null;
+    }
+    return { action, reason, sellPct };
   }
 
   logger.warn({ action }, "[llm] unknown action in decision");

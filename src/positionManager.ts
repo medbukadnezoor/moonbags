@@ -5,7 +5,7 @@ import { CONFIG, SOL_MINT } from "./config.js";
 import logger from "./logger.js";
 import { buyTokenWithSol, sellTokenForSol, getWalletTokenBalance, unwrapResidualWsol } from "./jupClient.js";
 import { getBatchPricesParallel, getPriceViaSellQuote } from "./priceFeed.js";
-import { notifyBuy, notifyBuyFail, notifySell, notifySellFail, notifyArmed, notifyMoonbagStart, notifyLlmActive, notifyLlmTighten, notifyMilestone } from "./notifier.js";
+import { notifyBuy, notifyBuyFail, notifySell, notifySellFail, notifyArmed, notifyMoonbagStart, notifyLlmActive, notifyLlmTighten, notifyLlmPartial, notifyMilestone } from "./notifier.js";
 import { consultLlm, type LlmContext } from "./llmExitAdvisor.js";
 import { getPositionSnapshot } from "./okxClient.js";
 import {
@@ -615,6 +615,124 @@ async function partialSellAndMoonbag(position: Position, reason: "trail"): Promi
   unwrapResidualWsol().catch((err) => logger.warn({ err: String(err) }, "[wsol] post-partial-sell unwrap failed"));
 }
 
+/**
+ * LLM-managed partial exit — sell a fraction of the CURRENT tokensHeld and
+ * keep the rest of the position running with its existing trail/stop/LLM
+ * coverage. This is how we capture long-runner upside: lock profit in
+ * chunks while staying exposed for more.
+ *
+ * Key differences from partialSellAndMoonbag (which is for the non-LLM
+ * moonbag flow):
+ *   - Position never flips into "moonbag mode" — the remainder keeps being
+ *     consulted by the LLM each tick.
+ *   - Called by the LLM advisor, not by the static trail path.
+ *   - Entry basis is reduced proportionally so future PnL math on the
+ *     remaining piece is correct (e.g. 50% partial sell cuts entrySolSpent
+ *     in half — remaining piece's PnL is measured vs the residual entry).
+ */
+async function partialSellPosition(
+  position: Position,
+  sellPct: number,
+  reason: string,
+): Promise<void> {
+  if (position.status !== "open") {
+    logger.debug({ mint: position.mint, currentStatus: position.status }, "[partial-exit] skipped — not in 'open' state");
+    return;
+  }
+  const mint = position.mint;
+
+  // Cooldown gate — don't fire partials during a sell-retry backoff window.
+  if (position.lastSellAttemptAt && Date.now() - position.lastSellAttemptAt < SELL_RETRY_COOLDOWN_MS) {
+    logger.debug({ mint, sellPct }, "[partial-exit] within sell cooldown, skipping");
+    return;
+  }
+
+  position.status = "closing";
+  position.lastSellAttemptAt = Date.now();
+  markDirty();
+
+  const walletBalance = await getWalletTokenBalance(mint);
+  if (walletBalance === 0n) {
+    // Position tokens no longer present — treat as fully closed (manual sell).
+    position.status = "closed";
+    position.exitReason = "manual";
+    markDirty();
+    scheduleCleanup(mint);
+    return;
+  }
+  const totalTokens = walletBalance ?? position.tokensHeld;
+  const sellTokens = BigInt(Math.floor(Number(totalTokens) * sellPct));
+  const remainingTokens = totalTokens - sellTokens;
+
+  // Guards: avoid edge cases that would leave a useless dust position
+  if (sellTokens <= 0n || remainingTokens < totalTokens / 10n) {
+    logger.warn({ mint, totalTokens: totalTokens.toString(), sellTokens: sellTokens.toString(), remainingTokens: remainingTokens.toString() }, "[partial-exit] degenerate sell size, escalating to exit_now");
+    position.status = "open";
+    markDirty();
+    await closePosition(mint, "llm");
+    return;
+  }
+
+  const sellResult = await sellTokenForSol(mint, sellTokens);
+  if (!sellResult) {
+    position.status = "open";
+    markDirty();
+    logger.warn({ mint, sellPct }, "[partial-exit] sell failed, will retry on next LLM consult after cooldown");
+    return;
+  }
+
+  const exitSol = Number(sellResult.solReceivedLamports) / 1e9;
+  const entrySolBefore = position.entrySolSpent;
+  const allocatedEntry = entrySolBefore * sellPct;
+  const remainingEntry = entrySolBefore * (1 - sellPct);
+  realizedPnlSol += exitSol - allocatedEntry;
+
+  // Capture original tokensHeld the FIRST time a partial fires, so we can
+  // compute a true "full-round-trip" PnL later.
+  position.originalTokensHeld = position.originalTokensHeld ?? totalTokens;
+
+  // Update position state: reduced size, reduced basis, back to open.
+  position.tokensHeld = remainingTokens;
+  position.entrySolSpent = remainingEntry;
+  position.status = "open";
+  position.sellFailureCount = 0;
+  position.lastSellAttemptAt = undefined;
+  position.lastLlmReason = reason;
+
+  // Log the partial in the position history so subsequent consults know.
+  position.partialExits = position.partialExits ?? [];
+  position.partialExits.push({
+    at: Date.now(),
+    sellPct,
+    exitSol,
+    priceSol: position.currentPricePerTokenSol,
+    reason,
+    sig: sellResult.signature,
+  });
+  markDirty();
+
+  const partialPnlPct = allocatedEntry > 0 ? (exitSol / allocatedEntry - 1) * 100 : 0;
+  const currentPnlPct = position.entryPricePerTokenSol > 0
+    ? (position.currentPricePerTokenSol / position.entryPricePerTokenSol - 1) * 100
+    : 0;
+
+  logger.info(
+    { mint, sellPct, exitSol, partialPnlPct, currentPnlPct, remainingTokens: remainingTokens.toString(), priorPartials: position.partialExits.length - 1 },
+    "[llm] partial_exit executed",
+  );
+  void notifyLlmPartial({
+    name: position.name,
+    mint,
+    sellPct,
+    exitSol,
+    partialPnlPct,
+    currentPnlPct,
+    reason,
+    signature: sellResult.signature ?? "",
+  });
+  unwrapResidualWsol().catch((err) => logger.warn({ err: String(err) }, "[wsol] post-partial-exit unwrap failed"));
+}
+
 async function closePosition(mint: string, reason: "trail" | "stop" | "timeout" | "manual" | "moonbag_trail" | "moonbag_timeout" | "llm"): Promise<void> {
   const position = positions.get(mint);
   if (!position) return;
@@ -859,5 +977,21 @@ async function consultOnePosition(position: Position): Promise<void> {
     position.lastLlmReason = decision.reason;
     markDirty();
     await closePosition(position.mint, "llm");
+    return;
+  }
+
+  if (decision.action === "partial_exit" && decision.sellPct != null) {
+    // Safety caps — defensive beyond the validator in llmExitAdvisor.
+    if (decision.sellPct < 0.10 || decision.sellPct > 0.75) {
+      logger.warn({ mint: position.mint, sellPct: decision.sellPct }, "[llm] partial_exit sellPct out of band, ignoring");
+      return;
+    }
+    // Don't allow too many partial exits per position (sanity cap).
+    const priorPartials = position.partialExits?.length ?? 0;
+    if (priorPartials >= 5) {
+      logger.warn({ mint: position.mint, priorPartials }, "[llm] partial_exit cap reached (5), ignoring");
+      return;
+    }
+    await partialSellPosition(position, decision.sellPct, decision.reason);
   }
 }

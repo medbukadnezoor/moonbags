@@ -193,6 +193,33 @@ export function notifyLlmTighten(args: {
 }
 
 /**
+ * LLM partial-exit notification — fires when the LLM decides to sell a
+ * fraction of the position to lock profit while keeping the rest running.
+ * Shows how much was sold, the PnL captured on that piece, and the current
+ * PnL of the still-held remainder.
+ */
+export function notifyLlmPartial(args: {
+  name: string;
+  mint: string;
+  sellPct: number;         // e.g. 0.30
+  exitSol: number;         // SOL received on this partial sell
+  partialPnlPct: number;   // PnL % on the piece that was sold
+  currentPnlPct: number;   // current total PnL of remaining position (informational)
+  reason: string;
+  signature: string;
+}): Promise<void> {
+  const partialSign = args.partialPnlPct >= 0 ? "+" : "";
+  const currentSign = args.currentPnlPct >= 0 ? "+" : "";
+  return send(
+    `💰 <b>LLM partial ${escapeHtml(args.name)}</b>  sold ${(args.sellPct * 100).toFixed(0)}%\n` +
+    `Locked: <b>${partialSign}${args.partialPnlPct.toFixed(1)}%</b> (${args.exitSol.toFixed(4)} SOL)\n` +
+    `Remainder still open at ${currentSign}${args.currentPnlPct.toFixed(1)}%\n` +
+    `<i>"${escapeHtml(args.reason)}"</i>\n` +
+    `<a href="${gmgn(escapeHtml(args.mint))}">GMGN</a>  ·  <a href="${solscan(escapeHtml(args.signature))}">tx ${escapeHtml(short(args.signature))}</a>`,
+  );
+}
+
+/**
  * Milestone alert — fires when a position crosses a PnL-% threshold for the
  * first time (e.g. +100%, +200%). Includes an inline sell button so the user
  * can take profit in one tap directly from the notification.

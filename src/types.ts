@@ -63,6 +63,16 @@ export interface Position {
   lastLlmReason?: string;         // surfaced in the SELL Telegram message when LLM triggers exit
   // Milestone notifications: which PnL-% thresholds have already fired (fire-once dedupe)
   milestonesHit?: number[];
+  // LLM-managed partial exits — log each time the LLM decides to sell a fraction
+  // of the position to lock profit while keeping the rest running.
+  partialExits?: Array<{
+    at: number;           // timestamp ms
+    sellPct: number;      // fraction of then-current tokensHeld that was sold
+    exitSol: number;      // SOL received from this partial sell
+    priceSol: number;     // token price in SOL at time of sell
+    reason: string;       // LLM's reason
+    sig?: string;         // tx signature
+  }>;
 }
 
 export interface JupOrderResponse {

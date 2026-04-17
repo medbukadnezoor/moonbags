@@ -24,7 +24,7 @@ type SnapshotRecord = { at: number; snap: PositionSnapshot };
 
 export type DecisionRecord = {
   at: number;
-  action: "hold" | "exit_now" | "set_trail" | "tighten_trail";   // legacy "tighten_trail" tolerated
+  action: "hold" | "exit_now" | "set_trail" | "partial_exit" | "tighten_trail";   // legacy "tighten_trail" tolerated
   newTrailPct?: number;
   oldTrailPct: number;
   reason: string;
