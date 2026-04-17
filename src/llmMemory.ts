@@ -156,15 +156,31 @@ export type LlmTradeRecord = {
   exitReason: string;
   decisions: DecisionRecord[];
   verdict:
-    | "correct_exit"
-    | "premature_exit"
-    | "correct_tighten"
-    | "premature_tighten"
-    | "held_well"
-    | "stuck_loser"
-    | "mixed";
+    | "correct_exit"        // LLM pulled the trigger, captured >70% of peak
+    | "premature_exit"      // LLM pulled the trigger, captured <70% of peak (jeeted too early)
+    | "correct_tighten"     // LLM tightened, captured >50% of peak
+    | "premature_tighten"   // LLM tightened, captured <50% of peak
+    | "held_well"           // all holds, exit POSITIVE and captured >60% of peak
+    | "held_partial_gain"   // all holds, exit POSITIVE but <60% of peak (profitable round-trip)
+    | "round_trip_loss"     // all holds, peaked >+50% then exited NEGATIVE (failed runner)
+    | "stuck_loser"         // all holds, never peaked above +50%, exited negative (dying token)
+    | "mixed";              // mixture of actions that don't cleanly fit above
 };
 
+/**
+ * Map a closed trade's decision timeline + outcome to a verdict label.
+ *
+ * The labels drive two things:
+ *   1. The /track histogram (how's the LLM doing overall)
+ *   2. Future L3 track-record injection ("you over-tighten" etc.)
+ *
+ * Distinguishing held_well vs held_partial_gain vs round_trip_loss vs
+ * stuck_loser matters because each needs a DIFFERENT corrective lesson:
+ *   - held_partial_gain  → "tighten earlier on fading momentum, lock more profit"
+ *   - round_trip_loss    → "protect peak gains, don't let winners become losers"
+ *   - stuck_loser        → "exit sooner when the initial thesis fails"
+ *   - held_well          → keep doing what you're doing
+ */
 export function computeVerdict(
   rec: Omit<LlmTradeRecord, "verdict">,
 ): LlmTradeRecord["verdict"] {
@@ -176,8 +192,8 @@ export function computeVerdict(
   );
   const hadExit = rec.exitReason === "llm";
   const allHolds = rec.decisions.length > 0 && rec.decisions.every((d) => d.action === "hold");
-  const exitPct = rec.exitPnlPct;
-  const peakPct = rec.peakPnlPct;
+  const exitPct = rec.exitPnlPct;   // decimal, e.g. 0.308 = +30.8%
+  const peakPct = rec.peakPnlPct;    // decimal, e.g. 2.574 = +257.4%
   const capturedRatio = peakPct > 0 ? exitPct / peakPct : 1;
 
   if (hadExit) {
@@ -187,7 +203,13 @@ export function computeVerdict(
     return capturedRatio > 0.5 ? "correct_tighten" : "premature_tighten";
   }
   if (allHolds) {
-    return exitPct > 0.5 ? "held_well" : "stuck_loser";
+    // Profitable exits split by how much of the peak they captured
+    if (exitPct > 0) {
+      return capturedRatio > 0.6 ? "held_well" : "held_partial_gain";
+    }
+    // Negative exits split by whether the position was ever a real winner
+    // (peaked above +50%) or was always bleeding (stuck_loser).
+    return peakPct > 0.5 ? "round_trip_loss" : "stuck_loser";
   }
   return "mixed";
 }
