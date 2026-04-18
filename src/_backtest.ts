@@ -2,7 +2,8 @@
  * Backtest: optimize exit strategy using OKX hot-tokens list.
  *
  * Usage:
- *   npx tsx src/_backtest.ts                         # simple trail grid (default)
+ *   npx tsx src/_backtest.ts                         # all deterministic exit modes (default)
+ *   npx tsx src/_backtest.ts --strategy simple        # simple trail grid
  *   npx tsx src/_backtest.ts --strategy hybrid        # trail + scale-out + moonbag grid
  *   npx tsx src/_backtest.ts --bar 5m --top 20
  *   npx tsx src/_backtest.ts --min-candles 80
@@ -10,8 +11,10 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { SCG_URL } from "./scgPoller.js";
+import type { ScgAlertsResponse } from "./types.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -24,8 +27,10 @@ const arg = (flag: string, def: string) => {
 };
 const BAR         = arg("--bar", "5m");
 const TOP_N       = parseInt(arg("--top", "15"));
+const TOKEN_LIMIT = parseInt(arg("--tokens", "0"));
 const MIN_CANDLES = parseInt(arg("--min-candles", "60"));   // ~5 hours of 5m data
-const STRATEGY    = arg("--strategy", "simple");            // "simple" | "hybrid" | "protective"
+const STRATEGY    = arg("--strategy", "all");               // "all" | "simple" | "hybrid" | "protective"
+const SOURCE      = arg("--source", "scg");                 // "scg" | "hot"
 const FEE_BPS     = parseInt(arg("--fee-bps", "50"));         // Ultra platform fee per swap (50 bps = 0.5%)
 const SLIPPAGE_BPS = parseInt(arg("--slippage-bps", "150"));  // estimated slippage per swap (150 bps = 1.5%)
 
@@ -40,6 +45,12 @@ const SCALEOUT_MULT_RANGE = [2, 3, 5];          // multiplier to trigger scale-o
 const MOONBAG_PCT_RANGE   = [0, 0.10, 0.20];    // fraction kept after trail (0 = disabled)
 const MB_TRAIL_RANGE      = [0.50, 0.60, 0.70]; // moonbag's own trail (drawdown from its peak)
 const MB_TIMEOUT_RANGE    = [30, 60, 120];       // moonbag max hold in minutes
+const FIXED_TP_RANGE      = [0.50, 0.75, 1.00, 1.50, 2.00, 3.00, 5.00];
+const TP_LADDER_PRESETS   = [
+  { label: "fast", targets: [{ pnlPct: 0.50, sellPct: 0.50 }, { pnlPct: 1.00, sellPct: 1.00 }] },
+  { label: "balanced", targets: [{ pnlPct: 0.50, sellPct: 0.25 }, { pnlPct: 1.00, sellPct: 0.25 }, { pnlPct: 2.00, sellPct: 1.00 }] },
+  { label: "runner", targets: [{ pnlPct: 0.50, sellPct: 0.25 }, { pnlPct: 1.00, sellPct: 0.25 }, { pnlPct: 2.00, sellPct: 0.25 }] },
+];
 
 // Protective-only grids (break-even protect + hard take-profit)
 // For BE: once price crosses the threshold, stop floor moves to entry (0% PnL).
@@ -53,18 +64,34 @@ const BAR_MS: Record<string, number> = {
   "1s": 1_000, "1m": 60_000, "5m": 300_000, "15m": 900_000,
   "30m": 1_800_000, "1H": 3_600_000, "4H": 14_400_000, "1D": 86_400_000,
 };
+const SCG_BAR_PRIORITY = ["5m", "15m", "1H"] as const;
+const SCG_MIN_RUNWAY_MS = 24 * 60 * 60 * 1000;
+const MIN_CANDLES_BY_BAR: Record<string, number> = {
+  "1m": 240,
+  "5m": 288,
+  "15m": 96,
+  "1H": 24,
+};
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 interface Candle { ts: number; open: number; high: number; low: number; close: number }
 interface SimResult { exitPct: number; reason: "trail" | "stop" | "tp" | "holding" | "no_entry" }
-interface TokenSample { address: string; symbol: string }
+interface TokenSample { address: string; symbol: string; alertTimeSec?: number; source: "scg" | "hot" }
+interface CandleSample { symbol: string; candles: Candle[]; bar: string }
+export type BacktestExitMode = "trail" | "fixed_tp" | "tp_ladder";
+export type BacktestTpTarget = { pnlPct: number; sellPct: number };
 interface GridResult {
+  strategyMode: BacktestExitMode;
   arm: number; trail: number; stop: number;
   scaleoutPct: number; scaleoutMult: number; moonbagPct: number;
   mbTrail: number; mbTimeout: number;
   breakEvenAfter: number; hardTPPct: number;
+  fixedTargetPct: number;
+  ladderLabel: string;
+  ladderTargets: BacktestTpTarget[];
+  trailRemainder: boolean;
   totalPnlPct: number; avgExitPct: number;
   wins: number; losses: number; holding: number; noEntry: number; trades: number;
   tpHits: number;       // how many trades exited via hard TP
@@ -136,7 +163,7 @@ async function fetchHotTokens(): Promise<TokenSample[]> {
   try {
     const rows = await runOnchainosJson<RawToken[]>(args, 15_000);
     const tokens = (rows ?? [])
-      .map(t => ({ address: t.tokenContractAddress, symbol: t.tokenSymbol }))
+      .map(t => ({ address: t.tokenContractAddress, symbol: t.tokenSymbol, source: "hot" as const }))
       .filter(t => t.address && t.symbol);
     if (tokens.length > 0) return tokens;
     throw new Error("hot-tokens returned no tokens");
@@ -146,6 +173,86 @@ async function fetchHotTokens(): Promise<TokenSample[]> {
       `then verify \`onchainos token hot-tokens --help\`. Cause: ${(err as Error).message}`,
     );
   }
+}
+
+async function fetchScgTokens(): Promise<TokenSample[]> {
+  const res = await fetch(SCG_URL);
+  if (!res.ok) {
+    throw new Error(`SCG alerts failed: HTTP ${res.status} ${res.statusText}`);
+  }
+  const body = (await res.json()) as ScgAlertsResponse;
+  const alerts = Array.isArray(body?.alerts) ? body.alerts : [];
+  const seen = new Set<string>();
+  const tokens: TokenSample[] = [];
+
+  for (const alert of alerts) {
+    if (!alert.mint || seen.has(alert.mint)) continue;
+    seen.add(alert.mint);
+    tokens.push({
+      address: alert.mint,
+      symbol: alert.name || alert.mint.slice(0, 6),
+      alertTimeSec: alert.alert_time,
+      source: "scg",
+    });
+  }
+
+  if (tokens.length === 0) throw new Error("SCG alerts returned no tokens");
+  await saveScgSnapshot(alerts).catch(() => undefined);
+  return tokens;
+}
+
+async function saveScgSnapshot(alerts: ScgAlertsResponse["alerts"]): Promise<void> {
+  const dir = path.resolve("state", "backtests");
+  await mkdir(dir, { recursive: true });
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  await writeFile(
+    path.join(dir, `scg-alerts-${timestamp}.json`),
+    JSON.stringify({ capturedAt: new Date().toISOString(), source: SCG_URL, alerts }, null, 2),
+  );
+}
+
+function candlesAfterAlert(candles: Candle[], alertTimeSec?: number): Candle[] {
+  if (!alertTimeSec || !Number.isFinite(alertTimeSec)) return candles;
+  const alertMs = alertTimeSec * 1000;
+  const firstTs = candles[0]?.ts;
+  const lastTs = candles[candles.length - 1]?.ts;
+  if (!firstTs || !lastTs || alertMs < firstTs || alertMs > lastTs) return [];
+  return candles.filter((c) => c.ts >= alertMs);
+}
+
+function hasRunway(candles: Candle[], alertTimeSec?: number): boolean {
+  if (!alertTimeSec || !Number.isFinite(alertTimeSec)) return true;
+  const lastTs = candles[candles.length - 1]?.ts;
+  return Boolean(lastTs && lastTs - alertTimeSec * 1000 >= SCG_MIN_RUNWAY_MS);
+}
+
+function minCandlesForBar(bar: string, configuredMin: number, source: "scg" | "hot"): number {
+  if (source === "scg") return MIN_CANDLES_BY_BAR[bar] ?? configuredMin;
+  return configuredMin;
+}
+
+async function fetchSampleCandles(token: TokenSample, preferredBar: string, configuredMin: number): Promise<CandleSample | null> {
+  if (token.source !== "scg") {
+    const candles = await fetchKlines(token.address, preferredBar);
+    return candles.length >= configuredMin ? { symbol: token.symbol, candles, bar: preferredBar } : null;
+  }
+
+  const bars = Array.from(new Set([preferredBar, ...SCG_BAR_PRIORITY]));
+  const eagerBars = bars.slice(0, 2);
+  const eager = await Promise.all(eagerBars.map(async (bar) => ({ bar, candles: candlesAfterAlert(await fetchKlines(token.address, bar), token.alertTimeSec) })));
+  for (const sample of eager) {
+    if (sample.candles.length >= minCandlesForBar(sample.bar, configuredMin, token.source) && hasRunway(sample.candles, token.alertTimeSec)) {
+      return { symbol: token.symbol, candles: sample.candles, bar: sample.bar };
+    }
+  }
+
+  for (const bar of bars.slice(2)) {
+    const candles = candlesAfterAlert(await fetchKlines(token.address, bar), token.alertTimeSec);
+    if (candles.length >= minCandlesForBar(bar, configuredMin, token.source) && hasRunway(candles, token.alertTimeSec)) {
+      return { symbol: token.symbol, candles, bar };
+    }
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -198,6 +305,9 @@ function simulate(
   mbTrail = 0.60, mbTimeoutMs = 0,
   breakEvenAfter = 0,   // if > 0, once price crosses (1+breakEvenAfter), stop floor moves to entry
   hardTPPct = 0,        // if > 0, sell everything at the TP level (1+hardTPPct)
+  strategyMode: BacktestExitMode = "trail",
+  ladderTargets: BacktestTpTarget[] = [],
+  trailRemainder = true,
 ): SimResult {
   const firstCandle = candles[0];
   if (!firstCandle) return { exitPct: 0, reason: "no_entry" };
@@ -221,11 +331,14 @@ function simulate(
   let mbPeak = 0;
   let mbStartTs = 0;
   let breakEvenArmed = false;   // once true, hard stop floor becomes entry (0% PnL)
+  const ladderHit = new Set<number>();
 
   for (const c of candles) {
     if (!moonbagMode) {
       if (c.high > runPeak) runPeak = c.high;
-      if (!armed && (c.high / decEntry - 1) >= arm) armed = true;
+      const trailEligible = strategyMode === "trail" ||
+        (strategyMode === "tp_ladder" && trailRemainder && ladderHit.size > 0);
+      if (!armed && trailEligible && (c.high / decEntry - 1) >= arm) armed = true;
 
       // Break-even protect: once price ever crosses the trigger, we never let
       // the position close below entry. Flips on at the FIRST candle whose
@@ -240,6 +353,24 @@ function simulate(
         const tpPrice = decEntry * (1 + hardTPPct);
         realizedPnl += position * (adjSell(tpPrice) / entry - 1);
         return { exitPct: realizedPnl * 100, reason: "tp" };
+      }
+
+      if (strategyMode === "tp_ladder" && ladderTargets.length > 0) {
+        for (let i = 0; i < ladderTargets.length; i++) {
+          const target = ladderTargets[i]!;
+          if (ladderHit.has(i) || (c.high / decEntry - 1) < target.pnlPct) continue;
+          const tpPrice = decEntry * (1 + target.pnlPct);
+          const sellPct = Math.min(position, position * target.sellPct);
+          realizedPnl += sellPct * (adjSell(tpPrice) / entry - 1);
+          position -= sellPct;
+          ladderHit.add(i);
+          if (position <= 0.001 || target.sellPct >= 0.999) {
+            return { exitPct: realizedPnl * 100, reason: "tp" };
+          }
+        }
+        if (!armed && trailRemainder && ladderHit.size > 0 && (c.high / decEntry - 1) >= arm) {
+          armed = true;
+        }
       }
     }
 
@@ -279,7 +410,9 @@ function simulate(
     // trailing stop — live bot sells the moment drawdown from peak ≥ trail%,
     // i.e. the moment price crosses peak × (1 - trail). Exit AT that level,
     // not at c.close, so different trails produce different exits.
-    if (armed) {
+    const canTrail = strategyMode === "trail" ||
+      (strategyMode === "tp_ladder" && trailRemainder && ladderHit.size > 0);
+    if (canTrail && armed) {
       const trailPrice = runPeak * (1 - trail);
       if (c.low <= trailPrice) {
         if (moonbagPct > 0 && position > moonbagPct) {
@@ -318,10 +451,13 @@ export interface RunBacktestOptions {
   // Scale-out is deliberately NOT included — the live bot has no scale-out feature,
   // so grading it would produce unusable adoptable params.
   hybrid?: boolean;
+  allStrategies?: boolean;      // compare trail, fixed TP, TP ladder, and a small moonbag grid.
   moonbagRange?: number[];    // fraction kept after trail (0 = disabled). default [0, 0.10, 0.20]
   mbTrailRange?: number[];    // moonbag's own drawdown trail. default [0.50, 0.60, 0.70]
   mbTimeoutRange?: number[];  // moonbag max hold, minutes. default [30, 60, 120]
   onProgress?: (stage: "fetching" | "simulating", pct: number) => void;
+  source?: "scg" | "hot";
+  tokenLimit?: number;
 }
 
 export interface RunBacktestResult {
@@ -330,6 +466,8 @@ export interface RunBacktestResult {
   allResults: GridResult[];     // full grid, sorted best→worst
   topResults: GridResult[];     // top N slice for convenience
   bar: string;
+  source: "scg" | "hot";
+  resolutionCounts: Record<string, number>;
   durationMs: number;
 }
 
@@ -343,6 +481,7 @@ export async function runBacktest(opts: RunBacktestOptions = {}): Promise<RunBac
   const bar = opts.bar ?? "5m";
   const minCandles = opts.minCandles ?? 60;
   const topN = opts.topN ?? 10;
+  const source = opts.source ?? "scg";
   const armRange   = opts.armRange ?? ARM_RANGE;
   const trailRange = opts.trailRange ?? TRAIL_RANGE;
   const stopRange  = opts.stopRange ?? STOP_RANGE;
@@ -351,43 +490,131 @@ export async function runBacktest(opts: RunBacktestOptions = {}): Promise<RunBac
 
   // 1. Fetch hot tokens
   opts.onProgress?.("fetching", 0);
-  const tokens = await fetchHotTokens();
+  const fetchedTokens = source === "scg" ? await fetchScgTokens() : await fetchHotTokens();
+  const tokens = opts.tokenLimit && opts.tokenLimit > 0 ? fetchedTokens.slice(0, opts.tokenLimit) : fetchedTokens;
 
   // 2. Fetch klines in parallel batches
-  const samples: Array<{ symbol: string; candles: Candle[] }> = [];
+  const samples: CandleSample[] = [];
   for (let i = 0; i < tokens.length; i += 5) {
     const batch = tokens.slice(i, i + 5);
-    const results = await Promise.all(
-      batch.map(async t => ({ symbol: t.symbol, candles: await fetchKlines(t.address, bar) })),
-    );
+    const results = await Promise.all(batch.map((t) => fetchSampleCandles(t, bar, minCandles)));
     for (const r of results) {
-      if (r.candles.length >= minCandles) samples.push(r);
+      if (r) samples.push(r);
     }
     opts.onProgress?.("fetching", Math.min(100, Math.round(((i + 5) / tokens.length) * 100)));
     if (i + 5 < tokens.length) await new Promise(r => setTimeout(r, 400));
   }
+  const resolutionCounts = samples.reduce<Record<string, number>>((acc, sample) => {
+    acc[sample.bar] = (acc[sample.bar] ?? 0) + 1;
+    return acc;
+  }, {});
+  if (samples.length === 0) {
+    return {
+      samplesUsed: 0,
+      tokensFetched: fetchedTokens.length,
+      allResults: [],
+      topResults: [],
+      bar,
+      source,
+      resolutionCounts,
+      durationMs: Date.now() - start,
+    };
+  }
 
-  // 3. Build grid. Simple mode: ARM × TRAIL × STOP. Hybrid mode: additionally
-  //    grid over moonbag params (keep a sliver running after trail fires).
-  //    Scale-out is intentionally excluded — live bot doesn't support it.
+  // 3. Build grid. Simple mode: ARM × TRAIL × STOP. Hybrid mode additionally
+  //    grids over moonbag params. All-strategies mode compares deterministic
+  //    exit families that Telegram can adopt: trail, fixed TP, and TP ladder.
   const mbRange   = opts.moonbagRange  ?? [0, 0.10, 0.20];
   const mbtRange  = opts.mbTrailRange  ?? [0.50, 0.60, 0.70];
   const mbtoRange = opts.mbTimeoutRange ?? [30, 60, 120];
-  type Combo = { arm: number; trail: number; stop: number; mbPct: number; mbTrail: number; mbTimeout: number };
+  type Combo = {
+    strategyMode: BacktestExitMode;
+    arm: number; trail: number; stop: number;
+    mbPct: number; mbTrail: number; mbTimeout: number;
+    fixedTargetPct: number;
+    ladderLabel: string;
+    ladderTargets: BacktestTpTarget[];
+    trailRemainder: boolean;
+  };
   const combos: Combo[] = [];
   for (const arm of armRange) {
     for (const trail of trailRange) {
       for (const stop of stopRange) {
-        if (!opts.hybrid) {
-          combos.push({ arm, trail, stop, mbPct: 0, mbTrail: 0, mbTimeout: 0 });
+        if (opts.allStrategies) {
+          combos.push({
+            strategyMode: "trail",
+            arm, trail, stop,
+            mbPct: 0, mbTrail: 0, mbTimeout: 0,
+            fixedTargetPct: 0,
+            ladderLabel: "",
+            ladderTargets: [],
+            trailRemainder: true,
+          });
+          for (const fixedTargetPct of FIXED_TP_RANGE) {
+            combos.push({
+              strategyMode: "fixed_tp",
+              arm: 0, trail: 0, stop,
+              mbPct: 0, mbTrail: 0, mbTimeout: 0,
+              fixedTargetPct,
+              ladderLabel: "",
+              ladderTargets: [],
+              trailRemainder: false,
+            });
+          }
+          for (const preset of TP_LADDER_PRESETS) {
+            combos.push({
+              strategyMode: "tp_ladder",
+              arm, trail, stop,
+              mbPct: 0, mbTrail: 0, mbTimeout: 0,
+              fixedTargetPct: 0,
+              ladderLabel: preset.label,
+              ladderTargets: preset.targets,
+              trailRemainder: true,
+            });
+          }
+          combos.push({
+            strategyMode: "trail",
+            arm, trail, stop,
+            mbPct: 0.10, mbTrail: 0.60, mbTimeout: 60,
+            fixedTargetPct: 0,
+            ladderLabel: "",
+            ladderTargets: [],
+            trailRemainder: true,
+          });
+        } else if (!opts.hybrid) {
+          combos.push({
+            strategyMode: "trail",
+            arm, trail, stop,
+            mbPct: 0, mbTrail: 0, mbTimeout: 0,
+            fixedTargetPct: 0,
+            ladderLabel: "",
+            ladderTargets: [],
+            trailRemainder: true,
+          });
         } else {
           for (const mbPct of mbRange) {
             if (mbPct === 0) {
-              combos.push({ arm, trail, stop, mbPct: 0, mbTrail: 0, mbTimeout: 0 });
+              combos.push({
+                strategyMode: "trail",
+                arm, trail, stop,
+                mbPct: 0, mbTrail: 0, mbTimeout: 0,
+                fixedTargetPct: 0,
+                ladderLabel: "",
+                ladderTargets: [],
+                trailRemainder: true,
+              });
             } else {
               for (const mbTrail of mbtRange) {
                 for (const mbTimeout of mbtoRange) {
-                  combos.push({ arm, trail, stop, mbPct, mbTrail, mbTimeout });
+                  combos.push({
+                    strategyMode: "trail",
+                    arm, trail, stop,
+                    mbPct, mbTrail, mbTimeout,
+                    fixedTargetPct: 0,
+                    ladderLabel: "",
+                    ladderTargets: [],
+                    trailRemainder: true,
+                  });
                 }
               }
             }
@@ -396,6 +623,20 @@ export async function runBacktest(opts: RunBacktestOptions = {}): Promise<RunBac
       }
     }
   }
+  const uniqueCombos = new Map<string, Combo>();
+  for (const combo of combos) {
+    const key = [
+      combo.strategyMode,
+      combo.arm, combo.trail, combo.stop,
+      combo.mbPct, combo.mbTrail, combo.mbTimeout,
+      combo.fixedTargetPct,
+      combo.ladderLabel,
+      combo.ladderTargets.map((target) => `${target.pnlPct}:${target.sellPct}`).join(","),
+      combo.trailRemainder,
+    ].join("|");
+    uniqueCombos.set(key, combo);
+  }
+  combos.splice(0, combos.length, ...uniqueCombos.values());
 
   // 4. Simulate
   //    PnL totals only include DECIDED trades (trail/stop/tp).
@@ -411,6 +652,8 @@ export async function runBacktest(opts: RunBacktestOptions = {}): Promise<RunBac
         combo.arm, combo.trail, combo.stop,
         0, 0,                                    // no scale-out
         combo.mbPct, combo.mbTrail, combo.mbTimeout * 60_000,
+        0, combo.fixedTargetPct,
+        combo.strategyMode, combo.ladderTargets, combo.trailRemainder,
       );
       if (sim.reason === "no_entry") { noEntry++; continue; }
       if (sim.reason === "holding") { holding++; continue; } // exclude from PnL totals
@@ -420,10 +663,15 @@ export async function runBacktest(opts: RunBacktestOptions = {}): Promise<RunBac
     }
     const decidedTrades = wins + losses;
     results.push({
+      strategyMode: combo.strategyMode,
       arm: combo.arm, trail: combo.trail, stop: combo.stop,
       scaleoutPct: 0, scaleoutMult: 0,
       moonbagPct: combo.mbPct, mbTrail: combo.mbTrail, mbTimeout: combo.mbTimeout,
-      breakEvenAfter: 0, hardTPPct: 0,
+      breakEvenAfter: 0, hardTPPct: combo.fixedTargetPct,
+      fixedTargetPct: combo.fixedTargetPct,
+      ladderLabel: combo.ladderLabel,
+      ladderTargets: combo.ladderTargets,
+      trailRemainder: combo.trailRemainder,
       totalPnlPct,
       avgExitPct: decidedTrades > 0 ? totalPnlPct / decidedTrades : 0,
       wins, losses, holding, noEntry,
@@ -448,10 +696,12 @@ export async function runBacktest(opts: RunBacktestOptions = {}): Promise<RunBac
 
   return {
     samplesUsed: samples.length,
-    tokensFetched: tokens.length,
+    tokensFetched: fetchedTokens.length,
     allResults: results,
     topResults: results.slice(0, topN),
     bar,
+    source,
+    resolutionCounts,
     durationMs: Date.now() - start,
   };
 }
@@ -462,6 +712,35 @@ export async function runBacktest(opts: RunBacktestOptions = {}): Promise<RunBac
 async function main(): Promise<void> {
   console.log(`\n📊 memeautobuy backtest  |  bar: ${BAR}  |  min candles: ${MIN_CANDLES}`);
   console.log(`   fee: ${FEE_BPS}bps (${(FEE_BPS/100).toFixed(2)}%)  |  slippage: ${SLIPPAGE_BPS}bps (${(SLIPPAGE_BPS/100).toFixed(2)}%)  |  round-trip haircut: ${((FEE_BPS+SLIPPAGE_BPS)*2/100).toFixed(2)}%\n`);
+
+  if (STRATEGY === "all") {
+    const result = await runBacktest({
+      bar: BAR,
+      topN: TOP_N,
+      minCandles: MIN_CANDLES,
+      allStrategies: true,
+      source: SOURCE === "hot" ? "hot" : "scg",
+      tokenLimit: TOKEN_LIMIT > 0 ? TOKEN_LIMIT : undefined,
+    });
+    const resolutionText = Object.entries(result.resolutionCounts).map(([bar, count]) => `${count} ${bar}`).join(" · ") || "none";
+    console.log(`Source: ${result.source} | usable samples: ${result.samplesUsed}/${result.tokensFetched} | OHLCV: ${resolutionText}`);
+    console.log("LLM Managed is not modeled; deterministic exits only.\n");
+    for (const [idx, r] of result.topResults.entries()) {
+      const winPct = ((r.wins / (r.wins + r.losses || 1)) * 100).toFixed(0);
+      const label = r.strategyMode === "fixed_tp"
+        ? `Fixed TP +${(r.fixedTargetPct * 100).toFixed(0)}% / STOP ${(r.stop * 100).toFixed(0)}%`
+        : r.strategyMode === "tp_ladder"
+          ? `TP Ladder ${r.ladderLabel} / ARM ${(r.arm * 100).toFixed(0)}% / TRAIL ${(r.trail * 100).toFixed(0)}% / STOP ${(r.stop * 100).toFixed(0)}%`
+          : `Trail / ARM ${(r.arm * 100).toFixed(0)}% / TRAIL ${(r.trail * 100).toFixed(0)}% / STOP ${(r.stop * 100).toFixed(0)}%` +
+            (r.moonbagPct > 0 ? ` / MB ${(r.moonbagPct * 100).toFixed(0)}%` : "");
+      console.log(
+        `#${idx + 1} ${label}\n` +
+        `   total ${r.totalPnlPct >= 0 ? "+" : ""}${r.totalPnlPct.toFixed(1)}% | avg ${r.avgExitPct >= 0 ? "+" : ""}${r.avgExitPct.toFixed(1)}% | ${r.wins}W/${r.losses}L/${r.holding}H | win ${winPct}%`,
+      );
+    }
+    console.log("");
+    return;
+  }
 
   // 1. Fetch hot tokens
   process.stdout.write("Fetching hot tokens... ");
@@ -498,7 +777,15 @@ async function main(): Promise<void> {
 
   // 3. Build grid combos
   const barMs = BAR_MS[BAR as keyof typeof BAR_MS] ?? 300_000;
-  type Combo = { arm: number; trail: number; stop: number; soPct: number; soMult: number; mbPct: number; mbTrail: number; mbTimeout: number; breakEvenAfter: number; hardTPPct: number };
+  type Combo = {
+    strategyMode?: BacktestExitMode;
+    arm: number; trail: number; stop: number; soPct: number; soMult: number; mbPct: number; mbTrail: number; mbTimeout: number;
+    breakEvenAfter: number; hardTPPct: number;
+    fixedTargetPct?: number;
+    ladderLabel?: string;
+    ladderTargets?: BacktestTpTarget[];
+    trailRemainder?: boolean;
+  };
   const combos: Combo[] = [];
 
   if (STRATEGY === "hybrid") {
@@ -554,6 +841,9 @@ async function main(): Promise<void> {
         combo.arm, combo.trail, combo.stop,
         combo.soPct, combo.soMult, combo.mbPct, combo.mbTrail, mbTimeoutMs,
         combo.breakEvenAfter, combo.hardTPPct,
+        combo.strategyMode ?? (combo.hardTPPct > 0 ? "fixed_tp" : "trail"),
+        combo.ladderTargets ?? [],
+        combo.trailRemainder ?? true,
       );
       if (sim.reason === "no_entry") { noEntry++; continue; }
       if (sim.reason === "holding") { holding++; continue; }
@@ -567,10 +857,15 @@ async function main(): Promise<void> {
 
     const decidedTrades = wins + losses;
     results.push({
+      strategyMode: combo.strategyMode ?? (combo.hardTPPct > 0 ? "fixed_tp" : "trail"),
       arm: combo.arm, trail: combo.trail, stop: combo.stop,
       scaleoutPct: combo.soPct, scaleoutMult: combo.soMult, moonbagPct: combo.mbPct,
       mbTrail: combo.mbTrail, mbTimeout: combo.mbTimeout,
       breakEvenAfter: combo.breakEvenAfter, hardTPPct: combo.hardTPPct,
+      fixedTargetPct: combo.fixedTargetPct ?? combo.hardTPPct,
+      ladderLabel: combo.ladderLabel ?? "",
+      ladderTargets: combo.ladderTargets ?? [],
+      trailRemainder: combo.trailRemainder ?? true,
       totalPnlPct,
       avgExitPct: decidedTrades > 0 ? totalPnlPct / decidedTrades : 0,
       wins, losses, holding, noEntry,

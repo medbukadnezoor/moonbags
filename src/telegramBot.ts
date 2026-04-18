@@ -17,7 +17,7 @@ import {
 import type { ScgAlertsResponse } from "./types.js";
 import { getPositionSnapshot } from "./okxClient.js";
 import { escapeHtml } from "./notifier.js";
-import { runBacktest } from "./_backtest.js";
+import { runBacktest, type BacktestTpTarget } from "./_backtest.js";
 import {
   getUpdateBlockerDetails,
   getUpdatePreview,
@@ -65,6 +65,12 @@ const EXIT_STRATEGY_LABELS: Record<ExitStrategyMode, string> = {
   fixed_tp: "🎯 Fixed TP",
   tp_ladder: "🪜 TP Ladder",
   llm_managed: "🧠 LLM Managed",
+};
+
+const BACKTEST_LADDER_PRESETS: Record<string, BacktestTpTarget[]> = {
+  fast: [{ pnlPct: 0.50, sellPct: 0.50 }, { pnlPct: 1.00, sellPct: 1.00 }],
+  balanced: [{ pnlPct: 0.50, sellPct: 0.25 }, { pnlPct: 1.00, sellPct: 0.25 }, { pnlPct: 2.00, sellPct: 1.00 }],
+  runner: [{ pnlPct: 0.50, sellPct: 0.25 }, { pnlPct: 1.00, sellPct: 0.25 }, { pnlPct: 2.00, sellPct: 0.25 }],
 };
 
 function setConfigValue(key: SettableKey, raw: string): SetConfigResult {
@@ -1055,8 +1061,9 @@ async function handleSetupStatus(chatId: number): Promise<void> {
 let backtestInFlight = false;
 
 async function handleBacktest(chatId: number, argText: string = ""): Promise<void> {
-  // `/backtest hybrid` grids over moonbag params additionally.
-  const mode: "simple" | "hybrid" = argText.trim().toLowerCase() === "hybrid" ? "hybrid" : "simple";
+  // `/backtest` compares all deterministic exit modes against SCG alerts.
+  // `/backtest hybrid` preserves the moonbag-heavy trail grid.
+  const mode: "all" | "hybrid" = argText.trim().toLowerCase() === "hybrid" ? "hybrid" : "all";
 
   if (backtestInFlight) {
     await tgPost("sendMessage", {
@@ -1069,16 +1076,13 @@ async function handleBacktest(chatId: number, argText: string = ""): Promise<voi
 
   // Status message we'll update as progress happens
   const llmWarning = CONFIG.LLM_EXIT_ENABLED
-    ? "\n⚠️ <b>LLM exit advisor is ON.</b> This backtest models static-trail mode only — " +
-      (mode === "hybrid"
-        ? "MOONBAG params would only fire with LLM off."
-        : "adopted ARM/TRAIL/STOP become ceilings the LLM can tighten against.")
+    ? "\n⚠️ <b>LLM exit advisor is ON.</b> LLM decisions are not candle-backtestable; this compares deterministic exits only."
     : "";
   const startMsg = await tgPost("sendMessage", {
     chat_id: chatId,
     text:
-      `🧪 <b>Running ${mode === "hybrid" ? "hybrid" : "simple"} backtest...</b>\n` +
-      `<i>Fetching ~100 hot-tokens on Solana + 5m klines. Entry = oldest candle per token (no filter — mirrors bot receiving alert).\n` +
+      `🧪 <b>Running ${mode === "hybrid" ? "hybrid" : "exit strategy"} backtest...</b>\n` +
+      `<i>Fetching SCG alerts + OHLCV from signal time with at least ~24h runway when available.\n` +
       `This takes ~60 seconds.</i>` +
       llmWarning,
     parse_mode: "HTML",
@@ -1086,11 +1090,13 @@ async function handleBacktest(chatId: number, argText: string = ""): Promise<voi
   const statusId = startMsg?.result?.message_id;
 
   try {
-    const { topResults, allResults, samplesUsed, tokensFetched, durationMs } = await runBacktest({
+    const { topResults, allResults, samplesUsed, tokensFetched, durationMs, source, resolutionCounts } = await runBacktest({
       bar: "5m",
       topN: 5,
       minCandles: 60,
       hybrid: mode === "hybrid",
+      allStrategies: mode === "all",
+      source: "scg",
     });
 
     if (!topResults.length) {
@@ -1101,7 +1107,9 @@ async function handleBacktest(chatId: number, argText: string = ""): Promise<voi
       return;
     }
 
-    // Where does the CURRENT config rank? For hybrid we also match on moonbag params.
+    // Where does the CURRENT config rank? For all-mode, match the structured exit type too.
+    const settings = getRuntimeSettings();
+    const currentStrategy = settings.exit.profitStrategy;
     const curArm = CONFIG.ARM_PCT;
     const curTrail = CONFIG.TRAIL_PCT;
     const curStop = CONFIG.STOP_PCT;
@@ -1109,40 +1117,67 @@ async function handleBacktest(chatId: number, argText: string = ""): Promise<voi
     const curMbTrail = CONFIG.MB_TRAIL_PCT;
     const curMbTimeoutMin = CONFIG.MB_TIMEOUT_SECS / 60;
     const curIdx = allResults.findIndex(
-      (r) =>
-        Math.abs(r.arm - curArm) < 0.001 &&
-        Math.abs(r.trail - curTrail) < 0.001 &&
-        Math.abs(r.stop - curStop) < 0.001 &&
-        (mode === "simple" ||
-          (Math.abs(r.moonbagPct - curMb) < 0.001 &&
-           Math.abs(r.mbTrail - curMbTrail) < 0.001 &&
-           Math.abs(r.mbTimeout - curMbTimeoutMin) < 0.01)),
+      (r) => {
+        if (mode === "all" && r.strategyMode !== currentStrategy.type) return false;
+        if (currentStrategy.type === "fixed_tp") {
+          return Math.abs(r.fixedTargetPct - currentStrategy.fixedTargetPct) < 0.001 &&
+            Math.abs(r.stop - curStop) < 0.001;
+        }
+        return Math.abs(r.arm - curArm) < 0.001 &&
+          Math.abs(r.trail - curTrail) < 0.001 &&
+          Math.abs(r.stop - curStop) < 0.001 &&
+          (mode !== "hybrid" ||
+            (Math.abs(r.moonbagPct - curMb) < 0.001 &&
+             Math.abs(r.mbTrail - curMbTrail) < 0.001 &&
+             Math.abs(r.mbTimeout - curMbTimeoutMin) < 0.01));
+      },
     );
     const curRow = curIdx >= 0 ? allResults[curIdx] : null;
 
     // Compact formatting for hybrid rows (extra params)
     const fmtCombo = (r: typeof allResults[number]): string => {
+      if (r.strategyMode === "fixed_tp") {
+        return `🎯 Fixed TP +${(r.fixedTargetPct*100).toFixed(0)}% / STOP ${(r.stop*100).toFixed(0)}%`;
+      }
+      if (r.strategyMode === "tp_ladder") {
+        const targets = r.ladderTargets.map((target) => `${(target.pnlPct*100).toFixed(0)}:${(target.sellPct*100).toFixed(0)}`).join(",");
+        return `🪜 TP Ladder ${r.ladderLabel || "custom"} (${targets}) / ARM ${(r.arm*100).toFixed(0)}% / TRAIL ${(r.trail*100).toFixed(0)}% / STOP ${(r.stop*100).toFixed(0)}%`;
+      }
       const base = `ARM ${(r.arm*100).toFixed(0)}% / TRAIL ${(r.trail*100).toFixed(0)}% / STOP ${(r.stop*100).toFixed(0)}%`;
       if (mode !== "hybrid") return base;
       if (r.moonbagPct === 0) return `${base} · MB off`;
       return `${base} · MB ${(r.moonbagPct*100).toFixed(0)}% @trail ${(r.mbTrail*100).toFixed(0)}% (${r.mbTimeout}m)`;
     };
     const fmtComboBtn = (r: typeof allResults[number]): string => {
+      if (r.strategyMode === "fixed_tp") return `Fixed TP ${(r.fixedTargetPct*100).toFixed(0)}%`;
+      if (r.strategyMode === "tp_ladder") return `Ladder ${r.ladderLabel || "custom"}`;
       const base = `ARM ${(r.arm*100).toFixed(0)} TRAIL ${(r.trail*100).toFixed(0)} STOP ${(r.stop*100).toFixed(0)}`;
       if (mode !== "hybrid") return base;
       if (r.moonbagPct === 0) return `${base} MB off`;
       return `${base} MB ${(r.moonbagPct*100).toFixed(0)}%`;
     };
+    const callbackFor = (r: typeof allResults[number]): string => {
+      if (r.strategyMode === "fixed_tp") {
+        return `adopt:fixed:${r.fixedTargetPct.toFixed(2)}:${r.stop.toFixed(2)}`;
+      }
+      if (r.strategyMode === "tp_ladder") {
+        return `adopt:ladder:${r.ladderLabel || "balanced"}:${r.arm.toFixed(2)}:${r.trail.toFixed(2)}:${r.stop.toFixed(2)}`;
+      }
+      return r.moonbagPct > 0
+        ? `adopt:hybrid:${r.arm.toFixed(2)}:${r.trail.toFixed(2)}:${r.stop.toFixed(2)}:${r.moonbagPct.toFixed(2)}:${r.mbTrail.toFixed(2)}:${r.mbTimeout}`
+        : `adopt:simple:${r.arm.toFixed(2)}:${r.trail.toFixed(2)}:${r.stop.toFixed(2)}`;
+    };
 
     // Build message
     const lines: string[] = [];
     lines.push(`🧪 <b>Backtest complete</b> (${mode})`);
-    lines.push(`<i>${samplesUsed}/${tokensFetched} tokens · ${allResults.length} combos · ${Math.round(durationMs/1000)}s · 5m bars · entry at oldest candle</i>`);
+    const resolutionText = Object.entries(resolutionCounts).map(([k, v]) => `${v} ${k}`).join(" · ") || "none";
+    lines.push(`<i>${samplesUsed}/${tokensFetched} SCG alerts · ${allResults.length} combos · ${Math.round(durationMs/1000)}s · OHLCV from signal time · ${resolutionText}</i>`);
+    lines.push("");
+    lines.push("Source: SCG alert_time entry, requiring usable post-signal OHLCV. 1m cannot cover 24h with the current 299-candle cap, so recommendations mostly use 5m/15m/1H.");
     lines.push("");
     if (CONFIG.LLM_EXIT_ENABLED) {
-      lines.push(`⚠️ <b>LLM is ON</b> — ${mode === "hybrid"
-        ? "MOONBAG params only take effect with LLM off."
-        : "adopted params are ceilings the LLM can tighten against."}`);
+      lines.push("⚠️ <b>LLM is ON</b> — LLM Managed is not modeled here. Adopting a deterministic result switches the exit strategy.");
       lines.push("");
     }
 
@@ -1152,8 +1187,12 @@ async function handleBacktest(chatId: number, argText: string = ""): Promise<voi
       lines.push(`<b>Your current:</b>  ${fmtCombo(curRow)}`);
       lines.push(`   +${curRow.totalPnlPct.toFixed(0)}%  ·  avg +${curRow.avgExitPct.toFixed(0)}%/trade  ·  ${curRow.wins}W/${curRow.losses}L/${curRow.holding}H  ·  ${curWinPct.toFixed(0)}% win  ·  <b>rank #${rank}/${allResults.length}</b>`);
     } else {
-      lines.push(`<b>Your current</b> (ARM ${(curArm*100).toFixed(0)}% / TRAIL ${(curTrail*100).toFixed(0)}% / STOP ${(curStop*100).toFixed(0)}%) isn't in the test grid.`);
+      lines.push(`<b>Your current</b> (${EXIT_STRATEGY_LABELS[currentStrategy.type]}) isn't in the test grid.`);
     }
+    lines.push("");
+    const best = topResults[0]!;
+    lines.push(`<b>Recommended:</b> ${fmtCombo(best)}`);
+    lines.push(`   +${best.totalPnlPct.toFixed(0)}% · avg +${best.avgExitPct.toFixed(0)}%/trade · ${best.wins}W/${best.losses}L/${best.holding}H`);
     lines.push("");
     lines.push(`<b>Top 5 combos:</b>`);
 
@@ -1170,14 +1209,8 @@ async function handleBacktest(chatId: number, argText: string = ""): Promise<voi
     lines.push("");
     lines.push(`<i>Tap a row to adopt (applies live, no restart needed).</i>`);
 
-    // Buttons — callback_data carries mode + params so adopt handler knows what to write.
-    // simple  → adopt:simple:arm:trail:stop
-    // hybrid  → adopt:hybrid:arm:trail:stop:mbPct:mbTrail:mbTimeoutMin
     const buttons = topResults.map((r, i): [{ text: string; callback_data: string }] => {
-      const data = mode === "hybrid"
-        ? `adopt:hybrid:${r.arm.toFixed(2)}:${r.trail.toFixed(2)}:${r.stop.toFixed(2)}:${r.moonbagPct.toFixed(2)}:${r.mbTrail.toFixed(2)}:${r.mbTimeout}`
-        : `adopt:simple:${r.arm.toFixed(2)}:${r.trail.toFixed(2)}:${r.stop.toFixed(2)}`;
-      return [{ text: `Adopt #${i+1}: ${fmtComboBtn(r)}`, callback_data: data }];
+      return [{ text: `Adopt #${i+1}: ${fmtComboBtn(r)}`, callback_data: callbackFor(r) }];
     });
     buttons.push([{ text: "❌ Cancel", callback_data: "adopt:cancel" }]);
 
@@ -1355,10 +1388,63 @@ async function handleUpdateConfirmed(chatId: number): Promise<void> {
 //   adopt:cancel
 //   adopt:simple:arm:trail:stop
 //   adopt:hybrid:arm:trail:stop:mbPct:mbTrail:mbTimeoutMin
+//   adopt:fixed:target:stop
+//   adopt:ladder:preset:arm:trail:stop
 async function handleAdopt(chatId: number, data: string): Promise<void> {
   const parts = data.split(":");
   if (parts[1] === "cancel") {
     await tgPost("sendMessage", { chat_id: chatId, text: "❌ Cancelled. Config unchanged." });
+    return;
+  }
+  if (parts[1] === "fixed") {
+    const target = parts[2];
+    const stop = parts[3];
+    if (!target || !stop) {
+      await tgPost("sendMessage", { chat_id: chatId, text: "⚠️ Malformed fixed adopt data." });
+      return;
+    }
+    const current = getRuntimeSettings();
+    await tgPost("sendMessage", {
+      chat_id: chatId,
+      text:
+        `⚠️ <b>Confirm adopt? (fixed TP)</b>\n\n` +
+        `<pre>${escapeHtml(`Strategy  ${EXIT_STRATEGY_LABELS[current.exit.profitStrategy.type]} -> Fixed TP\nTP        +${(parseFloat(target)*100).toFixed(0)}%\nSTOP      ${(CONFIG.STOP_PCT*100).toFixed(0)}% -> ${(parseFloat(stop)*100).toFixed(0)}%`)}</pre>\n` +
+        `Applies live, writes to state/settings.json. No restart needed.`,
+      parse_mode: "HTML",
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "✅ Yes, adopt", callback_data: `confirm-adopt:fixed:${target}:${stop}` }],
+          [{ text: "❌ Cancel", callback_data: "adopt:cancel" }],
+        ],
+      },
+    });
+    return;
+  }
+  if (parts[1] === "ladder") {
+    const preset = parts[2];
+    const arm = parts[3];
+    const trail = parts[4];
+    const stop = parts[5];
+    const targets = preset ? BACKTEST_LADDER_PRESETS[preset] : undefined;
+    if (!preset || !targets || !arm || !trail || !stop) {
+      await tgPost("sendMessage", { chat_id: chatId, text: "⚠️ Malformed ladder adopt data." });
+      return;
+    }
+    const targetText = targets.map((target) => `${(target.pnlPct*100).toFixed(0)}:${(target.sellPct*100).toFixed(0)}`).join(",");
+    await tgPost("sendMessage", {
+      chat_id: chatId,
+      text:
+        `⚠️ <b>Confirm adopt? (TP ladder)</b>\n\n` +
+        `<pre>${escapeHtml(`Strategy  -> TP Ladder\nTargets   ${targetText}\nARM       ${(CONFIG.ARM_PCT*100).toFixed(0)}% -> ${(parseFloat(arm)*100).toFixed(0)}%\nTRAIL     ${(CONFIG.TRAIL_PCT*100).toFixed(0)}% -> ${(parseFloat(trail)*100).toFixed(0)}%\nSTOP      ${(CONFIG.STOP_PCT*100).toFixed(0)}% -> ${(parseFloat(stop)*100).toFixed(0)}%`)}</pre>\n` +
+        `Applies live, writes to state/settings.json. No restart needed.`,
+      parse_mode: "HTML",
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "✅ Yes, adopt", callback_data: `confirm-adopt:ladder:${preset}:${arm}:${trail}:${stop}` }],
+          [{ text: "❌ Cancel", callback_data: "adopt:cancel" }],
+        ],
+      },
+    });
     return;
   }
   const mode = parts[1] === "hybrid" ? "hybrid" : "simple";
@@ -1454,7 +1540,75 @@ async function handleAdopt(chatId: number, data: string): Promise<void> {
 async function handleAdoptConfirmed(chatId: number, data: string): Promise<void> {
   // data = "confirm-adopt:simple:arm:trail:stop"
   //      | "confirm-adopt:hybrid:arm:trail:stop:mbPct:mbTrail:mbTimeoutMin"
+  //      | "confirm-adopt:fixed:target:stop"
+  //      | "confirm-adopt:ladder:preset:arm:trail:stop"
   const parts = data.split(":");
+  if (parts[1] === "fixed") {
+    const target = parts[2];
+    const stop = parts[3];
+    if (!target || !stop) {
+      await tgPost("sendMessage", { chat_id: chatId, text: "⚠️ Malformed fixed confirm-adopt data." });
+      return;
+    }
+    const stopResult = setConfigValue("STOP_PCT", stop);
+    if (!stopResult.ok) {
+      await tgPost("sendMessage", { chat_id: chatId, text: `⚠️ Adopt failed: ${stopResult.error}` });
+      return;
+    }
+    setTpTargets([{ pnlPct: parseFloat(target), sellPct: 1 }]);
+    const pct = (parseFloat(target) * 100).toFixed(0);
+    logger.info({ target, stop }, "[telegram] fixed TP backtest config adopted");
+    await tgPost("sendMessage", {
+      chat_id: chatId,
+      text:
+        `✅ <b>Adopted Fixed TP</b>\n` +
+        `TP: +${pct}%\n` +
+        `STOP: ${(parseFloat(stop)*100).toFixed(0)}%\n\n` +
+        `<i>Saved to state/settings.json and active on next tick. No restart needed.</i>`,
+      parse_mode: "HTML",
+    });
+    return;
+  }
+  if (parts[1] === "ladder") {
+    const preset = parts[2];
+    const arm = parts[3];
+    const trail = parts[4];
+    const stop = parts[5];
+    const targets = preset ? BACKTEST_LADDER_PRESETS[preset] : undefined;
+    if (!preset || !targets || !arm || !trail || !stop) {
+      await tgPost("sendMessage", { chat_id: chatId, text: "⚠️ Malformed ladder confirm-adopt data." });
+      return;
+    }
+    type SetEntry = { key: SettableKey; value: string; result: ReturnType<typeof setConfigValue> };
+    const results: SetEntry[] = [
+      { key: "ARM_PCT", value: arm, result: setConfigValue("ARM_PCT", arm) },
+      { key: "TRAIL_PCT", value: trail, result: setConfigValue("TRAIL_PCT", trail) },
+      { key: "STOP_PCT", value: stop, result: setConfigValue("STOP_PCT", stop) },
+    ];
+    const failures = results.filter(r => !r.result.ok);
+    if (failures.length > 0) {
+      await tgPost("sendMessage", {
+        chat_id: chatId,
+        text: `⚠️ Adopt partially failed:\n${failures.map(f => `${f.key}=${f.value} → ${(f.result as { ok: false; error: string }).error}`).join("\n")}`,
+      });
+      return;
+    }
+    setTpTargets(targets);
+    const targetText = targets.map((target) => `${(target.pnlPct*100).toFixed(0)}:${(target.sellPct*100).toFixed(0)}`).join(",");
+    logger.info({ preset, arm, trail, stop }, "[telegram] TP ladder backtest config adopted");
+    await tgPost("sendMessage", {
+      chat_id: chatId,
+      text:
+        `✅ <b>Adopted TP Ladder (${escapeHtml(preset)})</b>\n` +
+        `Targets: <code>${escapeHtml(targetText)}</code>\n` +
+        `ARM: ${(parseFloat(arm)*100).toFixed(0)}%\n` +
+        `TRAIL: ${(parseFloat(trail)*100).toFixed(0)}%\n` +
+        `STOP: ${(parseFloat(stop)*100).toFixed(0)}%\n\n` +
+        `<i>Saved to state/settings.json and active on next tick. No restart needed.</i>`,
+      parse_mode: "HTML",
+    });
+    return;
+  }
   const mode = parts[1] === "hybrid" ? "hybrid" : "simple";
   const arm   = parts[2];
   const trail = parts[3];
@@ -1493,6 +1647,7 @@ async function handleAdoptConfirmed(chatId: number, data: string): Promise<void>
     });
     return;
   }
+  setExitStrategy("trail");
 
   logger.info({ mode, arm, trail, stop, extra: mode === "hybrid" ? { mb: parts[5], mbTrail: parts[6], mbTimeoutMin: parts[7] } : undefined }, "[telegram] backtest config adopted");
 

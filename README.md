@@ -552,7 +552,7 @@ Every command is gated to the `TELEGRAM_CHAT_ID` in `.env` — random users who 
 | `/skip <mint>` | Blacklist a token (ignore future SCG alerts for it). `/skip` alone lists current. `/skip clear` resets. **Persists across restart.** |
 | `/mint <mint>` | On-demand on-chain snapshot for any token: price + 5m/1h/4h/24h % changes, smart money / bundler / dev flow, top-10 holder PnL, dev hold %, LP burn, GMGN link. |
 | `/wallet` | Full wallet address + SOL balance + Solscan link. |
-| `/backtest` | Run a live backtest on 100 trending Solana tokens (~60s). Shows top 5 ARM/TRAIL/STOP combos vs your current config. Tap a row to **adopt** — settings save to `state/settings.json` and apply on the next tick, no restart needed. |
+| `/backtest` | Run the SCG alert backtester. Uses each alert's `alert_time` as entry, requires post-signal OHLCV runway, compares Trail, Fixed TP, and TP Ladder, then lets you tap a row to **adopt** the exit strategy live. |
 | `/doctor` | Run a health check from Telegram. Use this when the bot starts, after changing `.env`, or when something feels off. Mirrors `npm run doctor`. |
 | `/setup_status` | Show a plain-English setup checklist: credentials, wallet, Telegram, OKX OnchainOS, and remaining fixes. |
 | `/update` | Check `origin/main`, show incoming commits, then pull + restart through `pm2` after confirmation. Requires `git` and a `pm2` process named `moonbags`. |
@@ -796,9 +796,15 @@ After the restart, send `/doctor` and `/setup_status` to confirm the bot came ba
 
 Two scripts ship with the bot for tuning your trading params and researching individual tokens.
 
-### Grid-search backtester — `src/_backtest.ts`
+### SCG alert backtester — `src/_backtest.ts`
 
-Fetches the **top 100 trending Solana tokens** from OKX, pulls 24 hours of kline data per token, then grid-searches every combination of trail arm × trail drawdown × stop loss to find which settings would have produced the best PnL across that universe. The runtime defaults are seeded into `state/settings.json` from this same style of sweep.
+Fetches the current SCG Alpha alert window, saves a snapshot to `state/backtests/`, then uses each alert's `alert_time` as the simulated entry. It pulls OHLCV after that signal and requires roughly 24 hours of post-signal runway before a token is eligible for the recommendation. The backtester compares deterministic exit modes that Telegram can adopt live:
+
+- **Trail** — arm, trailing drawdown, hard stop.
+- **Fixed TP** — sell the whole position at a fixed take-profit percent.
+- **TP Ladder** — sell partial chunks at multiple take-profit targets, then trail the remainder.
+
+LLM Managed mode is intentionally not modeled because the LLM reads live holder, smart-money, dev, and momentum context that is not present in OHLCV candles.
 
 **Run with defaults (5m bars, top 15 results):**
 
@@ -809,27 +815,26 @@ npx tsx src/_backtest.ts
 **Customize via flags:**
 
 ```bash
-# Use 1-minute bars instead of 5m (denser data, slower fetch)
-npx tsx src/_backtest.ts --bar 1m
+# Use hot-token mode as a market sanity check instead of the SCG alert window
+npx tsx src/_backtest.ts --source hot
 
 # Show top 30 ranked combinations instead of 15
 npx tsx src/_backtest.ts --top 30
 
-# Skip tokens with fewer than 80 candles of data (cleaner sample)
-npx tsx src/_backtest.ts --min-candles 80
+# Smoke-test the first 25 SCG alerts while developing
+npx tsx src/_backtest.ts --tokens 25
 
 # Combine
-npx tsx src/_backtest.ts --bar 5m --top 25 --min-candles 60
+npx tsx src/_backtest.ts --bar 5m --top 25 --source scg
 ```
 
 **What you'll see** — a ranked table like this:
 
 ```
-ARM   TRAIL  STOP    | TOTAL PnL  | AVG/TRADE  | W / L / H | WIN%
-50%   55%    40%     | +12,840%   | +128%      | 42 / 31 / 27 | 58%
-50%   60%    40%     | +12,210%   | +122%      | 38 / 35 / 27 | 52%
-40%   55%    40%     | +11,990%   | +120%      | 44 / 29 / 27 | 60%
-...
+#1 TP Ladder balanced / ARM 50% / TRAIL 55% / STOP 40%
+   total +12,840% | avg +128% | 42W/31L/27H | win 58%
+#2 Fixed TP +100% / STOP 40%
+   total +12,210% | avg +122% | 38W/35L/27H | win 52%
 ```
 
 - **TOTAL PnL** — sum of % returns across all simulated trades
@@ -837,9 +842,9 @@ ARM   TRAIL  STOP    | TOTAL PnL  | AVG/TRADE  | W / L / H | WIN%
 - **W / L / H** — wins / losses / still-holding (trade hit neither stop nor trail by end of data)
 - **WIN%** — wins as % of completed trades (excluding holding)
 
-A CSV with the full grid is also written to `backtest_<timestamp>.csv` for further analysis in a spreadsheet.
+Telegram `/backtest` shows the same recommendation in chat and includes adopt buttons. Adopting saves to `state/settings.json`, switches the exit strategy if needed, and applies on the next position tick without a restart.
 
-**Tune `/settings` from this** — the row at the top of the table is the historical optimum across the sampled universe. The current defaults (`ARM=0.5`, `TRAIL=0.55`, `STOP=0.4`) sit near the top consistently. Run periodically to spot regime shifts.
+The current SCG endpoint does not expose pagination or arbitrary historical ranges; Chrome DevTools shows the Vault calling only `GET https://api.scgalpha.com/api/alerts`, and `limit`, `offset`, `page`, `before`, and `since` probes return the same window. Local snapshots in `state/backtests/` are how MoonBags builds a replayable history going forward.
 
 > ⚠️ Past performance ≠ future results, especially in meme coins. The backtest is a sanity check, not a guarantee.
 
