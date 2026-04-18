@@ -115,7 +115,7 @@ If you want to see the signal quality firsthand, follow [@scg_alpha](https://x.c
                        |     ▼
                        |   +----------------+
                        |   |  MiniMax M2.7  |   (optional —
-                       |   |  exit advisor  |    set LLM_EXIT_ENABLED=true)
+                       |   |  exit advisor  |    choose LLM Managed)
                        |   +----------------+
                        ▼
                   +----------------+
@@ -369,19 +369,20 @@ If you want the LLM to manage exit decisions for armed positions:
 
    Starter plan (1500 M2.7 requests / 5h) is plenty for ~6 simultaneous armed positions.
 2. Get your **Token Plan API Key** from [platform.minimax.io/user-center/payment/token-plan](https://platform.minimax.io/user-center/payment/token-plan).
-3. Set in `.env`:
+3. Set the API key in `.env`:
    ```
    MINIMAX_API_KEY=your-token-plan-key
-   LLM_EXIT_ENABLED=true
    ```
 
-You can leave `LLM_EXIT_ENABLED=false` and toggle it later from Telegram with `/llm`.
+Then choose **LLM Managed** from Telegram `/settings` → **Exit Strategy**.
 
 ---
 
 ## Environment variables reference
 
 Create `.env` in the project root with these values:
+
+Keep secrets here. Trading exit settings are edited in Telegram and persisted separately in `state/settings.json`, so you don't have to keep retyping the live risk knobs into the env file.
 
 ```env
 # === REQUIRED ===
@@ -395,20 +396,11 @@ PRIV_B58=base58-encoded-solana-keypair-secret
 # === RPC ===
 RPC_URL=https://beta.helius-rpc.com?api-key=${HELIUS_API_KEY}
 
-# === TRADING PARAMS ===
+# === TRADING BASICS ===
+# Exit strategy, TP ladder, trail, stop, moonbag, and milestones are edited
+# in Telegram and saved to state/settings.json.
 BUY_SIZE_SOL=0.02              # SOL per trade
 MAX_CONCURRENT_POSITIONS=10    # max open positions
-
-# Trailing stop (decimals, NOT %)
-ARM_PCT=0.5                    # arm trailing once PnL >= +50%
-TRAIL_PCT=0.55                 # exit if drawdown from peak >= 55% (backtest-optimum)
-STOP_PCT=0.4                   # hard stop if PnL <= -40%
-MAX_HOLD_SECS=99999999999999   # time-based exit (effectively disabled)
-
-# Optional moonbag (only used when LLM is OFF)
-MOONBAG_PCT=0                  # fraction to keep as a runner after trail (0 = disabled)
-MB_TRAIL_PCT=0.6               # moonbag's own trail
-MB_TIMEOUT_SECS=7200           # moonbag max hold
 
 # === ALERT FILTERS (0 = disabled) ===
 MAX_ALERT_AGE_MINS=0
@@ -435,14 +427,30 @@ TELEGRAM_BOT_TOKEN=8775xxxxxxx:AAGxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 TELEGRAM_CHAT_ID=518183629
 
 # === LLM EXIT ADVISOR ===
-LLM_EXIT_ENABLED=false         # true to let MiniMax manage exits
-MINIMAX_API_KEY=               # required when LLM_EXIT_ENABLED=true
+MINIMAX_API_KEY=               # required for LLM Managed exit strategy
+```
 
-# === MILESTONE ALERTS ===
-# Send a Telegram notification (with inline sell button) the first time a
-# position crosses each PnL threshold. Edit live via /settings, no restart.
-MILESTONES_ENABLED=true
-MILESTONE_PCTS=100,200,500,1000  # comma-separated % thresholds (2x/3x/6x/11x)
+On first boot, MoonBags creates `state/settings.json` from the env defaults. Telegram `/settings` then becomes the source of truth for live trading behavior:
+
+```json
+{
+  "exit": {
+    "profitStrategy": {
+      "type": "trail",
+      "fixedTargetPct": 1,
+      "ladderTargets": [
+        { "pnlPct": 0.5, "sellPct": 0.25 },
+        { "pnlPct": 1, "sellPct": 0.25 },
+        { "pnlPct": 2, "sellPct": 0.25 }
+      ],
+      "trailRemainder": true
+    },
+    "trail": { "armPct": 0.5, "trailPct": 0.55 },
+    "risk": { "stopPct": 0.4, "maxHoldSecs": 99999999999999999 },
+    "runner": { "keepPct": 0, "trailPct": 0.6, "timeoutSecs": 7200 },
+    "llm": { "enabled": false }
+  }
+}
 ```
 
 **Security note:** `.env` should never be committed. Add it to `.gitignore` (already present in this repo).
@@ -534,7 +542,7 @@ Every command is gated to the `TELEGRAM_CHAT_ID` in `.env` — random users who 
 |---------|-------------|
 | `/start` | 🌙 MoonBags dashboard: mode (LIVE/DRY), SOL balance, open positions (with armed ⚡ count), realized PnL, config summary, LLM state, uptime, wallet address. Inline buttons for Positions / Settings / Refresh. |
 | `/positions` | Open positions with one-tap force-sell buttons. Auto-refreshes 1.5s after a sell fires. |
-| `/settings` | Interactive menu — tap **[Edit]** on any numeric setting for a reply prompt, **[Toggle]** for booleans. Changes save to `.env` and apply on next tick — **no restart**. |
+| `/settings` | Interactive menu with Buy, Exit Strategy, Risk Controls, TP targets, milestones, and LLM controls. Trading changes save to `state/settings.json` and apply on next tick — **no restart**. |
 | `/pnl` | Today's PnL + all-time stats, win/loss count, win rate, best + worst trade. Reads `state/closed.json`. |
 | `/history [N]` | Last N closed trades (default 10, max 50) — name, PnL, exit reason, hold duration. |
 | `/llm` | One-tap toggle for the LLM exit advisor. Warns if `MINIMAX_API_KEY` is empty. |
@@ -544,7 +552,7 @@ Every command is gated to the `TELEGRAM_CHAT_ID` in `.env` — random users who 
 | `/skip <mint>` | Blacklist a token (ignore future SCG alerts for it). `/skip` alone lists current. `/skip clear` resets. **Persists across restart.** |
 | `/mint <mint>` | On-demand on-chain snapshot for any token: price + 5m/1h/4h/24h % changes, smart money / bundler / dev flow, top-10 holder PnL, dev hold %, LP burn, GMGN link. |
 | `/wallet` | Full wallet address + SOL balance + Solscan link. |
-| `/backtest` | Run a live backtest on 100 trending Solana tokens (~60s). Shows top 5 ARM/TRAIL/STOP combos vs your current config. Tap a row to **adopt** — settings save to `.env` and apply on the next tick, no restart needed. |
+| `/backtest` | Run a live backtest on 100 trending Solana tokens (~60s). Shows top 5 ARM/TRAIL/STOP combos vs your current config. Tap a row to **adopt** — settings save to `state/settings.json` and apply on the next tick, no restart needed. |
 | `/doctor` | Run a health check from Telegram. Use this when the bot starts, after changing `.env`, or when something feels off. Mirrors `npm run doctor`. |
 | `/setup_status` | Show a plain-English setup checklist: credentials, wallet, Telegram, OKX OnchainOS, and remaining fixes. |
 | `/update` | Check `origin/main`, show incoming commits, then pull + restart through `pm2` after confirmation. Requires `git` and a `pm2` process named `moonbags`. |
@@ -554,7 +562,7 @@ Every command is gated to the `TELEGRAM_CHAT_ID` in `.env` — random users who 
 Sent to your Telegram chat as events happen. Dedupe is built in so you don't get spammed:
 
 - `🟢 BUY` — every buy (mcap, spent, tx link)
-- `⚡ ARMED` — when a position hits `ARM_PCT` and trailing activates
+- `⚡ ARMED` — when a position hits the configured trail arm threshold and trailing activates
 - `🤖 LLM watching` — fires **once per position** when the LLM advisor first picks it up
 - `🤖 LLM tightened 55% → 25%` / `🤖 LLM loosened 25% → 55%` — only when the LLM actually changes the trail (≥1% delta), direction-aware copy
 - `🚀 / 🌙 / 💎 / 👑 <TOKEN> hit +100%` — **milestone alerts** with an inline sell button when a position crosses each configured PnL % (fires once per threshold). Tap the button to close in one tap.
@@ -566,13 +574,12 @@ Sent to your Telegram chat as events happen. Dedupe is built in so you don't get
 
 - `BUY_SIZE_SOL` — SOL per trade
 - `MAX_CONCURRENT_POSITIONS` — max open positions
-- `ARM_PCT` — when trailing arms (decimal, e.g. 0.5 = +50%)
-- `TRAIL_PCT` — drawdown from peak that triggers exit
-- `STOP_PCT` — hard stop loss
-- `MAX_HOLD_SECS` — time-based exit
-- `LLM_EXIT_ENABLED` — toggle LLM advisor on/off
-- `MILESTONES_ENABLED` — toggle milestone PnL alerts on/off
-- `MILESTONE_PCTS` — comma-separated PnL % thresholds, e.g. `100,200,500,1000`
+- **Exit Strategy** — Trail, Fixed TP, TP Ladder, or LLM Managed
+- **TP targets** — typed as `50:25,100:25,200:25` for +50% sell 25%, +100% sell 25%, etc.
+- **Risk Controls** — trail arm, trail drawdown, hard stop, and max hold
+- **Runner / Moonbag** — keep a remainder after profit-taking and trail it separately
+- **Milestones** — notification thresholds with inline sell buttons
+- **LLM Managed** — let MiniMax manage profit exits when configured
 
 **NOT editable from Telegram (security boundary):**
 
@@ -584,7 +591,7 @@ Sent to your Telegram chat as events happen. Dedupe is built in so you don't get
 
 ## LLM exit advisor
 
-When `LLM_EXIT_ENABLED=true`, MoonBags consults MiniMax M2.7 every 30 seconds for each **armed** position (PnL ≥ ARM_PCT).
+When you choose **LLM Managed** in Telegram, MoonBags consults MiniMax M2.7 every 30 seconds for each **armed** position.
 
 ### What the LLM sees
 
@@ -630,7 +637,7 @@ Polling cost: ~120 LLM calls per armed position per hour. The Starter plan (1500
 
 ### Safety net
 
-The hard stop (`STOP_PCT`) is **always active** regardless of LLM state. If MiniMax goes down or returns garbage, the bot falls back to the existing trail logic. The LLM never gets to override the floor.
+The configured hard stop is **always active** regardless of LLM state. If MiniMax goes down or returns garbage, the bot falls back to the existing trail logic. The LLM never gets to override the floor.
 
 ---
 
@@ -642,7 +649,7 @@ When a position's PnL crosses a threshold you configured, a Telegram message fir
 
 ### How it works
 
-- Every 3-second tick, after PnL is computed, the bot checks whether the current PnL just crossed any threshold in `MILESTONE_PCTS`.
+- Every 3-second tick, after PnL is computed, the bot checks whether the current PnL just crossed any configured milestone threshold.
 - The first time a position crosses a given threshold, a notification fires. Each threshold fires **at most once per position** (dedupe via `position.milestonesHit[]`, persisted across restarts).
 - The inline button uses the same `sell:<mint>` callback as the sell buttons in `/positions`, so tapping it works instantly.
 
@@ -660,12 +667,12 @@ Tier icons: 🚀 for 2x, 🌙 for 3x, 💎 for 5-9x, 👑 for 10x+.
 
 ### Configuration
 
-Both knobs editable live via `/settings` in Telegram:
+Editable live via `/settings` in Telegram:
 
 | Setting | Description |
 |---------|-------------|
-| `MILESTONES_ENABLED` | Feature toggle (default ON) |
-| `MILESTONE_PCTS` | Comma-separated % thresholds, e.g. `100,200,500,1000`. Max 10 values. |
+| Enabled | Feature toggle (default ON) |
+| Thresholds | Comma-separated % thresholds, e.g. `100,200,500,1000`. Max 10 values. |
 
 Changes take effect on the next tick — no restart needed.
 
@@ -690,7 +697,7 @@ A live dashboard runs on `http://localhost:8787/` (configurable via `DASHBOARD_P
   - **Real 1m price chart** — last ~60 minutes of OKX kline data as an SVG line + area, dashed reference line at entry price
   - SELL button (currently a stub — manual sell via Telegram `/positions`)
 - **Live feed** — compact mini cards for recent SCG alerts. Each shows token icon, GMGN/JUP links, organic-score chip, and an inline `CLOSED +420%` badge if you've already traded that token (reads from `state/closed.json`).
-- **Bottom config strip** — fixed 48px showing BUY / ARM / TRAIL / STOP / LLM / DRY values. The "EDIT IN TELEGRAM /settings" link auto-resolves your bot username via `getMe` and opens `https://t.me/<botname>` in a new tab.
+- **Bottom config strip** — fixed 48px showing BUY, the structured exit block, moonbag controls, LLM, and DRY values. The "EDIT IN TELEGRAM /settings" link auto-resolves your bot username via `getMe` and opens `https://t.me/<botname>` in a new tab.
 
 **Localhost-only with no auth** — don't expose it externally. For remote access, tunnel via SSH:
 
@@ -721,6 +728,7 @@ The bot writes to `state/` in the project directory:
 |------|---------|
 | `state/positions.json` | Live position state — restored on restart |
 | `state/closed.json` | Append-only log of all closed trades (used by `/pnl`, `/history`). Capped at 500 entries. |
+| `state/settings.json` | Live trading exit/settings state edited in Telegram; secrets still live in `.env`. |
 | `state/poller.json` | `paused` flag and blacklist — survives restart |
 | `state/stranded.json` | Audit log of in-flight positions reconciled on boot. Worth manual review if anything appears here. |
 
@@ -744,8 +752,8 @@ The bot writes to `state/` in the project directory:
 Use `/settings` from Telegram. Common adjustments:
 
 - **Markets are crazy bullish:** raise `BUY_SIZE_SOL` to deploy more capital per trade.
-- **Bot is missing big runners:** widen `TRAIL_PCT` (e.g. 0.55 → 0.70) so wicks don't shake you out.
-- **Too many flat trades:** raise `STOP_PCT` to give positions more room (or lower it for tighter risk).
+- **Bot is missing big runners:** widen the Trail setting (e.g. 55% → 70%) so wicks don't shake you out.
+- **Too many flat trades:** loosen the Stop setting to give positions more room, or tighten it for lower risk.
 - **Pausing during macro events:** `/pause`, then `/resume` when ready.
 
 ### Emergency: kill all positions
@@ -790,7 +798,7 @@ Two scripts ship with the bot for tuning your trading params and researching ind
 
 ### Grid-search backtester — `src/_backtest.ts`
 
-Fetches the **top 100 trending Solana tokens** from OKX, pulls 24 hours of kline data per token, then grid-searches every combination of `ARM_PCT × TRAIL_PCT × STOP_PCT` to find which settings would have produced the best PnL across that universe. The defaults shipped in `.env.example` were derived from this exact script.
+Fetches the **top 100 trending Solana tokens** from OKX, pulls 24 hours of kline data per token, then grid-searches every combination of trail arm × trail drawdown × stop loss to find which settings would have produced the best PnL across that universe. The runtime defaults are seeded into `state/settings.json` from this same style of sweep.
 
 **Run with defaults (5m bars, top 15 results):**
 
@@ -831,7 +839,7 @@ ARM   TRAIL  STOP    | TOTAL PnL  | AVG/TRADE  | W / L / H | WIN%
 
 A CSV with the full grid is also written to `backtest_<timestamp>.csv` for further analysis in a spreadsheet.
 
-**Tune your `.env` from this** — the row at the top of the table is the historical optimum across the sampled universe. The current defaults (`ARM=0.5`, `TRAIL=0.55`, `STOP=0.4`) sit near the top consistently. Run periodically to spot regime shifts.
+**Tune `/settings` from this** — the row at the top of the table is the historical optimum across the sampled universe. The current defaults (`ARM=0.5`, `TRAIL=0.55`, `STOP=0.4`) sit near the top consistently. Run periodically to spot regime shifts.
 
 > ⚠️ Past performance ≠ future results, especially in meme coins. The backtest is a sanity check, not a guarantee.
 
@@ -880,7 +888,7 @@ Common fixes:
 1. **Use a dedicated wallet.** Never put a wallet that holds anything important into `PRIV_B58`. Funds in this wallet are exposed to whatever the bot does.
 2. **Start with `DRY_RUN=true`.** Watch logs for at least an hour before going live.
 3. **Start with small `BUY_SIZE_SOL`.** 0.02 SOL is a safe starting point — that's roughly $4 per trade at $200/SOL. Scale up only after seeing the bot perform.
-4. **Keep `STOP_PCT` set.** This is your floor. The LLM and the trail can both be wrong; the hard stop saves you from total wipeout on a single trade.
+4. **Keep a stop loss set.** This is your floor. The LLM and the trail can both be wrong; the hard stop saves you from total wipeout on a single trade.
 5. **Don't expose the dashboard publicly.** It has no authentication. Use SSH tunneling for remote access.
 6. **Review `state/stranded.json` after every restart.** Anything appearing there means the bot recovered an in-flight position from your wallet — verify it's correct.
 7. **Test `/sellall` once in dry-run.** Make sure you're comfortable with the confirmation flow before relying on it in an emergency.

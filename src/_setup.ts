@@ -343,15 +343,14 @@ async function main(): Promise<void> {
   const mmKey = await ask(`   ${bold("MINIMAX_API_KEY")} ${dim("(blank to skip)")}: `);
   if (mmKey) {
     collected.MINIMAX_API_KEY = mmKey;
-    const enable = await askYesNo("   Enable LLM advisor now?", false);
-    collected.LLM_EXIT_ENABLED = enable ? "true" : "false";
+    console.log(gray("   Enable LLM Managed later from Telegram /settings -> Exit Strategy."));
   }
 
   // 8. Trading params
   section("Trading parameters", 8);
-  console.log(gray("   Defaults are backtest-optimized against ~100 hot-token Solana candidates."));
-  console.log(gray("   Press Enter to accept each, or type a new value."));
-  console.log(gray("   You can change any of these live via /settings in Telegram."));
+  console.log(gray("   Keep .env focused on credentials and runtime basics."));
+  console.log(gray("   Exit strategy, TP ladder, trail, stop, and moonbag settings now live in"));
+  console.log(gray("   state/settings.json and are edited from Telegram /settings."));
   console.log("");
   collected.BUY_SIZE_SOL = await askWithDefault(
     `   SOL per trade (${bold("BUY_SIZE_SOL")}):`,
@@ -361,24 +360,11 @@ async function main(): Promise<void> {
     `   Max open positions (${bold("MAX_CONCURRENT_POSITIONS")}):`,
     existingEnv.match(/^MAX_CONCURRENT_POSITIONS=(.+)$/m)?.[1] ?? "10",
   );
-  collected.ARM_PCT = await askWithDefault(
-    `   Trail arms at +${yellow("50%")} profit (${bold("ARM_PCT")} decimal):`,
-    existingEnv.match(/^ARM_PCT=(.+)$/m)?.[1] ?? "0.5",
-  );
-  collected.TRAIL_PCT = await askWithDefault(
-    `   Trail exit on ${yellow("55%")} drawdown from peak (${bold("TRAIL_PCT")} decimal):`,
-    existingEnv.match(/^TRAIL_PCT=(.+)$/m)?.[1] ?? "0.55",
-  );
-  collected.STOP_PCT = await askWithDefault(
-    `   Hard stop at -${yellow("40%")} from entry (${bold("STOP_PCT")} decimal):`,
-    existingEnv.match(/^STOP_PCT=(.+)$/m)?.[1] ?? "0.4",
-  );
   const dry = await askYesNo(`   Start in ${green("DRY_RUN")} (safe — no real trades)?`, true);
   collected.DRY_RUN = dry ? "true" : "false";
 
   // Ensure all required defaults exist even if the user skipped
   if (!collected.MINIMAX_API_KEY && !mmFromEnv) collected.MINIMAX_API_KEY = "";
-  if (!collected.LLM_EXIT_ENABLED) collected.LLM_EXIT_ENABLED = "false";
   if (!existingEnv.match(/^RPC_URL=/m)) {
     collected.RPC_URL = "https://beta.helius-rpc.com?api-key=${HELIUS_API_KEY}";
   }
@@ -388,7 +374,6 @@ async function main(): Promise<void> {
   if (!existingEnv.match(/^SCG_POLL_MS=/m)) collected.SCG_POLL_MS = "3000";
   if (!existingEnv.match(/^PRICE_POLL_MS=/m)) collected.PRICE_POLL_MS = "3000";
   if (!existingEnv.match(/^SLIPPAGE_BPS=/m)) collected.SLIPPAGE_BPS = "2500";
-  if (!existingEnv.match(/^MAX_HOLD_SECS=/m)) collected.MAX_HOLD_SECS = "99999999999999999";
 
   // 9. Write .env
   section("Writing .env", 9);

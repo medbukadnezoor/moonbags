@@ -1,10 +1,6 @@
 import dotenv from "dotenv";
-import { readFileSync, writeFileSync } from "node:fs";
-import path from "node:path";
 
 dotenv.config();
-
-const ENV_FILE = path.resolve(".env");
 
 export const SOL_MINT = "So11111111111111111111111111111111111111112";
 export const JUP_BASE = "https://api.jup.ag/ultra/v1";
@@ -80,19 +76,18 @@ if (missing.length > 0) {
 
 // CONFIG is mutable so /settings in the Telegram bot can update values live.
 // API keys, wallet keys, and DRY_RUN are still NOT mutable via the in-process
-// updater (see SETTABLE_KEYS below). Direct file edits + restart are required
-// for those.
+// updater (see SETTABLE_KEYS below). Trading edits are persisted by settingsStore.
 export const CONFIG = ({
   JUP_API_KEY: JUP_API_KEY ?? "",
   HELIUS_API_KEY: HELIUS_API_KEY ?? "",
   PRIV_B58: PRIV_B58 ?? "",
   RPC_URL: resolveRpcUrl(),
-  BUY_SIZE_SOL: num("BUY_SIZE_SOL", 0.01),
-  MAX_CONCURRENT_POSITIONS: num("MAX_CONCURRENT_POSITIONS", 3),
+  BUY_SIZE_SOL: num("BUY_SIZE_SOL", 0.02),
+  MAX_CONCURRENT_POSITIONS: num("MAX_CONCURRENT_POSITIONS", 10),
   ARM_PCT: num("ARM_PCT", 0.5),
-  TRAIL_PCT: num("TRAIL_PCT", 0.2),
-  STOP_PCT: num("STOP_PCT", 0.3),
-  MAX_HOLD_SECS: num("MAX_HOLD_SECS", 1800),
+  TRAIL_PCT: num("TRAIL_PCT", 0.55),
+  STOP_PCT: num("STOP_PCT", 0.4),
+  MAX_HOLD_SECS: num("MAX_HOLD_SECS", 99_999_999_999_999_999),
   MAX_ALERT_AGE_MINS: num("MAX_ALERT_AGE_MINS", 5),
   MIN_LIQUIDITY_USD: num("MIN_LIQUIDITY_USD", 5000),
   MIN_SCORE: num("MIN_SCORE", 75),
@@ -245,23 +240,6 @@ export const SETTABLE_SPECS: Record<SettableKey, Spec> = {
 
 export type SetConfigResult = { ok: true } | { ok: false; error: string };
 
-function persistEnv(key: string, value: string): void {
-  let content: string;
-  try {
-    content = readFileSync(ENV_FILE, "utf8");
-  } catch {
-    content = "";
-  }
-  const line = `${key}=${value}`;
-  const re = new RegExp(`^${key}=.*$`, "m");
-  if (re.test(content)) {
-    content = content.replace(re, line);
-  } else {
-    content = content.endsWith("\n") || content === "" ? content + line + "\n" : content + "\n" + line + "\n";
-  }
-  writeFileSync(ENV_FILE, content);
-}
-
 export function setConfigValue(key: SettableKey, raw: string): SetConfigResult {
   const spec = SETTABLE_SPECS[key];
   let parsed: SettableValue;
@@ -285,13 +263,6 @@ export function setConfigValue(key: SettableKey, raw: string): SetConfigResult {
 
   // mutate in-memory CONFIG (typed as readonly but the object isn't frozen anymore)
   (CONFIG as unknown as Record<string, unknown>)[key] = parsed;
-  // persist to .env so the change survives restart
-  try {
-    const envValue = Array.isArray(parsed) ? parsed.join(",") : String(parsed);
-    persistEnv(key, envValue);
-  } catch (e) {
-    return { ok: false, error: `wrote in-memory but .env persist failed: ${(e as Error).message}` };
-  }
   return { ok: true };
 }
 

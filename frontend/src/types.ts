@@ -73,6 +73,34 @@ export type ClosedTrade = {
   exitSig?: string;
 };
 
+export type ExitSettings = {
+  profitStrategy: {
+    type: "trail" | "fixed_tp" | "tp_ladder" | "llm_managed";
+    fixedTargetPct: number;
+    ladderTargets: Array<{
+      pnlPct: number;
+      sellPct: number;
+    }>;
+    trailRemainder: boolean;
+  };
+  trail: {
+    armPct: number;
+    trailPct: number;
+  };
+  risk: {
+    stopPct: number;
+    maxHoldSecs: number;
+  };
+  runner: {
+    keepPct: number;
+    trailPct: number;
+    timeoutSecs: number;
+  };
+  llm: {
+    enabled: boolean;
+  };
+};
+
 export type State = {
   config: {
     BUY_SIZE_SOL: number;
@@ -87,6 +115,7 @@ export type State = {
     DRY_RUN: boolean;
     LLM_EXIT_ENABLED?: boolean;
   };
+  exitSettings?: ExitSettings;
   stats: {
     bootAt: number;
     realizedPnlSol: number;

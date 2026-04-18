@@ -221,6 +221,28 @@ export function notifyLlmPartial(args: {
   );
 }
 
+export function notifyTakeProfitPartial(args: {
+  name: string;
+  mint: string;
+  targetPnlPct: number;
+  sellPct: number;
+  exitSol: number;
+  partialPnlSol: number;
+  partialPnlPct: number;
+  currentPnlPct: number;
+  signature: string;
+}): Promise<void> {
+  const partialSign = args.partialPnlPct >= 0 ? "+" : "";
+  const pnlSolSign = args.partialPnlSol >= 0 ? "+" : "";
+  const currentSign = args.currentPnlPct >= 0 ? "+" : "";
+  return send(
+    `🎯 <b>TP ${escapeHtml(args.name)}</b>  +${(args.targetPnlPct * 100).toFixed(0)}% hit, sold ${(args.sellPct * 100).toFixed(0)}%\n` +
+    `Locked: <b>${partialSign}${args.partialPnlPct.toFixed(1)}%</b> (${pnlSolSign}${args.partialPnlSol.toFixed(4)} SOL; ${args.exitSol.toFixed(4)} SOL received)\n` +
+    `Remainder still open at ${currentSign}${args.currentPnlPct.toFixed(1)}%\n` +
+    `<a href="${gmgn(escapeHtml(args.mint))}">GMGN</a>  ·  <a href="${solscan(escapeHtml(args.signature))}">tx ${escapeHtml(short(args.signature))}</a>`,
+  );
+}
+
 /**
  * Milestone alert — fires when a position crosses a PnL-% threshold for the
  * first time (e.g. +100%, +200%). Includes an inline sell button so the user

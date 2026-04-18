@@ -5,9 +5,10 @@ import { CONFIG, SOL_MINT } from "./config.js";
 import logger from "./logger.js";
 import { buyTokenWithSol, sellTokenForSol, getWalletTokenBalance, unwrapResidualWsol } from "./jupClient.js";
 import { getBatchPricesParallel, getPriceViaSellQuote } from "./priceFeed.js";
-import { notifyBuy, notifyBuyFail, notifySell, notifySellFail, notifyArmed, notifyMoonbagStart, notifyLlmActive, notifyLlmTighten, notifyLlmPartial, notifyMilestone } from "./notifier.js";
+import { notifyBuy, notifyBuyFail, notifySell, notifySellFail, notifyArmed, notifyMoonbagStart, notifyLlmActive, notifyLlmTighten, notifyLlmPartial, notifyTakeProfitPartial, notifyMilestone } from "./notifier.js";
 import { consultLlm, type LlmContext } from "./llmExitAdvisor.js";
 import { getPositionSnapshot } from "./okxClient.js";
+import { getRuntimeSettings, type TpTarget } from "./settingsStore.js";
 import {
   appendLlmTradeRecord,
   computeVerdict,
@@ -19,6 +20,8 @@ import {
 const positions = new Map<string, Position>();
 const BOOT_AT = Date.now();
 let realizedPnlSol = 0;
+
+type CloseReason = "trail" | "stop" | "timeout" | "take_profit" | "manual" | "moonbag_trail" | "moonbag_timeout" | "llm";
 
 const STATE_DIR = path.resolve("state");
 const STATE_FILE = path.join(STATE_DIR, "positions.json");
@@ -428,6 +431,8 @@ async function tickOne(
   }
 
   position.currentPricePerTokenSol = currentPriceSol;
+  const settings = getRuntimeSettings();
+  const { profitStrategy, risk, trail, runner } = settings.exit;
 
   // Moonbag mode: track moonbag peak separately
   if (position.moonbagMode) {
@@ -439,9 +444,9 @@ async function tickOne(
     const mbElapsed = (Date.now() - (position.moonbagStartedAt ?? Date.now())) / 1000;
 
     let mbReason: "moonbag_trail" | "moonbag_timeout" | null = null;
-    if (CONFIG.MB_TIMEOUT_SECS > 0 && mbElapsed >= CONFIG.MB_TIMEOUT_SECS) {
+    if (runner.timeoutSecs > 0 && mbElapsed >= runner.timeoutSecs) {
       mbReason = "moonbag_timeout";
-    } else if (CONFIG.MB_TRAIL_PCT > 0 && mbDrawdown >= CONFIG.MB_TRAIL_PCT) {
+    } else if (runner.trailPct > 0 && mbDrawdown >= runner.trailPct) {
       mbReason = "moonbag_trail";
     }
 
@@ -468,8 +473,12 @@ async function tickOne(
 
   const pnlPct = currentPriceSol / entry - 1;
   const drawdownFromPeakPct = 1 - currentPriceSol / position.peakPricePerTokenSol;
+  const trailEligible =
+    profitStrategy.type === "trail" ||
+    profitStrategy.type === "llm_managed" ||
+    (profitStrategy.type === "tp_ladder" && profitStrategy.trailRemainder && (position.tpTargetsHit?.length ?? 0) > 0);
 
-  if (!position.armed && pnlPct >= CONFIG.ARM_PCT) {
+  if (!position.armed && trailEligible && pnlPct >= trail.armPct) {
     position.armed = true;
     markDirty();
     logger.info({ mint: position.mint, pnlPct }, "armed trailing");
@@ -479,12 +488,12 @@ async function tickOne(
   // Milestone alerts — fire a Telegram notification (with inline sell button)
   // the first time a position crosses each configured PnL threshold on its
   // way UP. Dedupe via position.milestonesHit so each fires at most once.
-  if (CONFIG.MILESTONES_ENABLED && pnlPct > 0 && CONFIG.MILESTONE_PCTS.length > 0) {
+  if (settings.milestones.enabled && pnlPct > 0 && settings.milestones.pcts.length > 0) {
     const pnlPctWhole = pnlPct * 100;
     const peakPnlPct = (position.peakPricePerTokenSol / entry - 1) * 100;
     const hit = position.milestonesHit ?? [];
     let dirty = false;
-    for (const milestone of CONFIG.MILESTONE_PCTS) {
+    for (const milestone of settings.milestones.pcts) {
       if (pnlPctWhole >= milestone && !hit.includes(milestone)) {
         hit.push(milestone);
         dirty = true;
@@ -509,14 +518,30 @@ async function tickOne(
   }
 
   // Effective trail: LLM may override CONFIG.TRAIL_PCT via dynamicTrailPct
-  const effectiveTrailPct = position.dynamicTrailPct ?? CONFIG.TRAIL_PCT;
+  const effectiveTrailPct = position.dynamicTrailPct ?? trail.trailPct;
 
-  let reason: "trail" | "stop" | "timeout" | null = null;
-  if ((Date.now() - position.openedAt) / 1000 >= CONFIG.MAX_HOLD_SECS) {
+  let reason: "trail" | "stop" | "timeout" | "take_profit" | null = null;
+  const elapsedSecs = (Date.now() - position.openedAt) / 1000;
+  if (risk.maxHoldSecs > 0 && elapsedSecs >= risk.maxHoldSecs) {
     reason = "timeout";
-  } else if (pnlPct <= -CONFIG.STOP_PCT) {
+  } else if (pnlPct <= -risk.stopPct) {
     reason = "stop";
-  } else if (position.armed && drawdownFromPeakPct >= effectiveTrailPct) {
+  } else if (profitStrategy.type === "fixed_tp" && pnlPct >= profitStrategy.fixedTargetPct) {
+    reason = "take_profit";
+  } else if (profitStrategy.type === "tp_ladder") {
+    const target = findTriggeredTpTarget(position, profitStrategy.ladderTargets, pnlPct);
+    if (target) {
+      if (target.target.sellPct >= 0.999) {
+        reason = "take_profit";
+      } else {
+        await partialSellForTakeProfit(position, target.index, target.target, pnlPct);
+        position.lastTickAt = Date.now();
+        return;
+      }
+    }
+  }
+
+  if (!reason && trailEligible && position.armed && drawdownFromPeakPct >= effectiveTrailPct) {
     reason = "trail";
   }
 
@@ -536,16 +561,22 @@ async function tickOne(
 
         let stillTriggered = false;
         if (reason === "timeout") {
-          stillTriggered = (Date.now() - position.openedAt) / 1000 >= CONFIG.MAX_HOLD_SECS;
+          stillTriggered = risk.maxHoldSecs > 0 && (Date.now() - position.openedAt) / 1000 >= risk.maxHoldSecs;
         } else if (reason === "stop") {
-          stillTriggered = confirmedPnl <= -CONFIG.STOP_PCT;
+          stillTriggered = confirmedPnl <= -risk.stopPct;
+        } else if (reason === "take_profit") {
+          if (profitStrategy.type === "fixed_tp") {
+            stillTriggered = confirmedPnl >= profitStrategy.fixedTargetPct;
+          } else if (profitStrategy.type === "tp_ladder") {
+            stillTriggered = Boolean(findTriggeredTpTarget(position, profitStrategy.ladderTargets, confirmedPnl));
+          }
         } else if (reason === "trail") {
           stillTriggered = position.armed && confirmedDrawdown >= effectiveTrailPct;
         }
 
         if (stillTriggered) {
           // Skip moonbag when LLM is active — LLM owns post-arm exit decisions.
-          if (reason === "trail" && CONFIG.MOONBAG_PCT > 0 && !CONFIG.LLM_EXIT_ENABLED) {
+          if ((reason === "trail" || reason === "take_profit") && runner.keepPct > 0 && !CONFIG.LLM_EXIT_ENABLED) {
             await partialSellAndMoonbag(position, reason);
           } else {
             await closePosition(position.mint, reason);
@@ -554,14 +585,14 @@ async function tickOne(
           logger.info({ mint: position.mint, reason, confirmedPrice }, "exit dismissed after re-quote");
         }
       } else {
-        if (reason === "trail" && CONFIG.MOONBAG_PCT > 0 && !CONFIG.LLM_EXIT_ENABLED) {
+        if ((reason === "trail" || reason === "take_profit") && runner.keepPct > 0 && !CONFIG.LLM_EXIT_ENABLED) {
           await partialSellAndMoonbag(position, reason);
         } else {
           await closePosition(position.mint, reason);
         }
       }
     } else {
-      if (reason === "trail" && CONFIG.MOONBAG_PCT > 0 && !CONFIG.LLM_EXIT_ENABLED) {
+      if ((reason === "trail" || reason === "take_profit") && runner.keepPct > 0 && !CONFIG.LLM_EXIT_ENABLED) {
         await partialSellAndMoonbag(position, reason);
       } else {
         await closePosition(position.mint, reason);
@@ -575,11 +606,119 @@ async function tickOne(
 const MAX_SELL_RETRIES = 10;
 const SELL_RETRY_COOLDOWN_MS = 60_000;
 
-async function partialSellAndMoonbag(position: Position, reason: "trail"): Promise<void> {
+function findTriggeredTpTarget(
+  position: Position,
+  targets: TpTarget[],
+  pnlPct: number,
+): { index: number; target: TpTarget } | null {
+  const hit = position.tpTargetsHit ?? [];
+  for (let index = 0; index < targets.length; index++) {
+    const target = targets[index];
+    if (!target || hit.includes(index)) continue;
+    if (pnlPct >= target.pnlPct) return { index, target };
+  }
+  return null;
+}
+
+async function partialSellForTakeProfit(
+  position: Position,
+  targetIndex: number,
+  target: TpTarget,
+  currentPnlPctDecimal: number,
+): Promise<void> {
+  if (position.status !== "open") {
+    logger.debug({ mint: position.mint, currentStatus: position.status }, "[tp] skipped - not in 'open' state");
+    return;
+  }
+  if (position.lastSellAttemptAt && Date.now() - position.lastSellAttemptAt < SELL_RETRY_COOLDOWN_MS) {
+    logger.debug({ mint: position.mint, targetIndex }, "[tp] within sell cooldown, skipping");
+    return;
+  }
+
+  const mint = position.mint;
+  position.status = "closing";
+  position.lastSellAttemptAt = Date.now();
+  markDirty();
+
+  const walletBalance = await getWalletTokenBalance(mint);
+  if (walletBalance === 0n) {
+    position.status = "closed";
+    position.exitReason = "manual";
+    markDirty();
+    scheduleCleanup(mint);
+    return;
+  }
+
+  const totalTokens = walletBalance ?? position.tokensHeld;
+  const sellTokens = BigInt(Math.floor(Number(totalTokens) * target.sellPct));
+  const remainingTokens = totalTokens - sellTokens;
+
+  if (sellTokens <= 0n || remainingTokens <= 0n) {
+    position.status = "open";
+    markDirty();
+    await closePosition(mint, "take_profit");
+    return;
+  }
+
+  const sellResult = await sellTokenForSol(mint, sellTokens);
+  if (!sellResult) {
+    position.status = "open";
+    markDirty();
+    logger.warn({ mint, targetIndex, sellPct: target.sellPct }, "[tp] partial sell failed, will retry");
+    return;
+  }
+
+  const exitSol = Number(sellResult.solReceivedLamports) / 1e9;
+  const entrySolBefore = position.entrySolSpent;
+  const allocatedEntry = entrySolBefore * target.sellPct;
+  const remainingEntry = entrySolBefore * (1 - target.sellPct);
+  realizedPnlSol += exitSol - allocatedEntry;
+
+  position.originalTokensHeld = position.originalTokensHeld ?? totalTokens;
+  position.tokensHeld = remainingTokens;
+  position.entrySolSpent = remainingEntry;
+  position.status = "open";
+  position.sellFailureCount = 0;
+  position.lastSellAttemptAt = undefined;
+  position.tpTargetsHit = Array.from(new Set([...(position.tpTargetsHit ?? []), targetIndex])).sort((a, b) => a - b);
+  position.partialExits = position.partialExits ?? [];
+  position.partialExits.push({
+    at: Date.now(),
+    sellPct: target.sellPct,
+    entrySol: allocatedEntry,
+    exitSol,
+    pnlSol: exitSol - allocatedEntry,
+    priceSol: position.currentPricePerTokenSol,
+    reason: `take_profit:${Math.round(target.pnlPct * 100)}%`,
+    sig: sellResult.signature,
+  });
+  await flushPersist();
+
+  const partialPnlPct = allocatedEntry > 0 ? (exitSol / allocatedEntry - 1) * 100 : 0;
+  logger.info(
+    { mint, targetIndex, targetPnlPct: target.pnlPct, sellPct: target.sellPct, exitSol, partialPnlPct, remainingTokens: remainingTokens.toString() },
+    "[tp] partial take-profit executed",
+  );
+  void notifyTakeProfitPartial({
+    name: position.name,
+    mint,
+    targetPnlPct: target.pnlPct,
+    sellPct: target.sellPct,
+    exitSol,
+    partialPnlSol: exitSol - allocatedEntry,
+    partialPnlPct,
+    currentPnlPct: currentPnlPctDecimal * 100,
+    signature: sellResult.signature ?? "",
+  });
+  unwrapResidualWsol().catch((err) => logger.warn({ err: String(err) }, "[wsol] post-tp-partial unwrap failed"));
+}
+
+async function partialSellAndMoonbag(position: Position, reason: "trail" | "take_profit"): Promise<void> {
   if (position.status !== "open") {
     logger.debug({ mint: position.mint, currentStatus: position.status }, "[partial-sell] skipped — not in 'open' state");
     return;
   }
+  const runner = getRuntimeSettings().exit.runner;
   const mint = position.mint;
   position.status = "closing";
   position.lastSellAttemptAt = Date.now();
@@ -594,7 +733,7 @@ async function partialSellAndMoonbag(position: Position, reason: "trail"): Promi
     return;
   }
   const totalTokens = walletBalance ?? position.tokensHeld;
-  const moonbagTokens = BigInt(Math.floor(Number(totalTokens) * CONFIG.MOONBAG_PCT));
+  const moonbagTokens = BigInt(Math.floor(Number(totalTokens) * runner.keepPct));
   const sellTokens = totalTokens - moonbagTokens;
 
   if (sellTokens <= 0n) {
@@ -613,9 +752,9 @@ async function partialSellAndMoonbag(position: Position, reason: "trail"): Promi
 
   const exitSol = Number(sellResult.solReceivedLamports) / 1e9;
   const entrySol = position.entrySolSpent;
-  const sellFraction = 1 - CONFIG.MOONBAG_PCT;
+  const sellFraction = 1 - runner.keepPct;
   const allocatedEntry = entrySol * sellFraction;
-  const moonbagEntry = entrySol * CONFIG.MOONBAG_PCT;
+  const moonbagEntry = entrySol * runner.keepPct;
   const pnlSolPct = allocatedEntry > 0 ? (exitSol / allocatedEntry - 1) * 100 : 0;
   realizedPnlSol += exitSol - allocatedEntry;
 
@@ -647,7 +786,7 @@ async function partialSellAndMoonbag(position: Position, reason: "trail"): Promi
     : 0;
 
   logger.info(
-    { mint, reason, exitSol, pnlSolPct, moonbagTokens: moonbagTokens.toString(), moonbagPct: CONFIG.MOONBAG_PCT },
+    { mint, reason, exitSol, pnlSolPct, moonbagTokens: moonbagTokens.toString(), moonbagPct: runner.keepPct },
     "partial sell done, moonbag active",
   );
 
@@ -660,9 +799,9 @@ async function partialSellAndMoonbag(position: Position, reason: "trail"): Promi
 
   void notifyMoonbagStart({
     name: position.name, mint,
-    moonbagPct: CONFIG.MOONBAG_PCT,
-    mbTrailPct: CONFIG.MB_TRAIL_PCT,
-    mbTimeoutMins: CONFIG.MB_TIMEOUT_SECS / 60,
+    moonbagPct: runner.keepPct,
+    mbTrailPct: runner.trailPct,
+    mbTimeoutMins: runner.timeoutSecs / 60,
   });
 
   unwrapResidualWsol().catch((err) => logger.warn({ err: String(err) }, "[wsol] post-partial-sell unwrap failed"));
@@ -789,7 +928,7 @@ async function partialSellPosition(
   unwrapResidualWsol().catch((err) => logger.warn({ err: String(err) }, "[wsol] post-partial-exit unwrap failed"));
 }
 
-async function closePosition(mint: string, reason: "trail" | "stop" | "timeout" | "manual" | "moonbag_trail" | "moonbag_timeout" | "llm"): Promise<void> {
+async function closePosition(mint: string, reason: CloseReason): Promise<void> {
   const position = positions.get(mint);
   if (!position) return;
 

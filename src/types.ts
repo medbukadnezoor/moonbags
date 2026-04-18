@@ -49,7 +49,7 @@ export interface Position {
   armed: boolean;
   openedAt: number;
   lastTickAt: number;
-  exitReason?: "trail" | "stop" | "timeout" | "manual" | "error" | "moonbag_trail" | "moonbag_timeout" | "llm";
+  exitReason?: "trail" | "stop" | "timeout" | "take_profit" | "manual" | "error" | "moonbag_trail" | "moonbag_timeout" | "llm";
   sellFailureCount?: number;
   lastSellAttemptAt?: number;
   moonbagMode?: boolean;
@@ -63,6 +63,8 @@ export interface Position {
   lastLlmReason?: string;         // surfaced in the SELL Telegram message when LLM triggers exit
   // Milestone notifications: which PnL-% thresholds have already fired (fire-once dedupe)
   milestonesHit?: number[];
+  // TP ladder targets already executed for this position (stores target indexes).
+  tpTargetsHit?: number[];
   // LLM-managed partial exits — log each time the LLM decides to sell a fraction
   // of the position to lock profit while keeping the rest running.
   partialExits?: Array<{

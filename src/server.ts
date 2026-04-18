@@ -8,6 +8,7 @@ import { getPositions, getStats, getClosedTrades } from "./positionManager.js";
 import { getRecentAlertEvents } from "./scgPoller.js";
 import { getTokenInfos } from "./jupTokensClient.js";
 import { getKline } from "./okxClient.js";
+import { getRuntimeSettings } from "./settingsStore.js";
 
 // One-time fetch of the Telegram bot username so the dashboard can deep-link
 // to it. Cached for the process lifetime.
@@ -58,6 +59,7 @@ async function buildState(): Promise<Record<string, unknown>> {
   const positions = getPositions();
   const alerts = getRecentAlertEvents().slice().reverse();
   const botUsername = await getBotUsername();
+  const runtimeSettings = getRuntimeSettings();
 
   // Enrich every open position + every recently-FIRED alert with Jupiter
   // Tokens API metadata (verification, organic score, audit, holder count, mcap, etc).
@@ -103,6 +105,7 @@ async function buildState(): Promise<Record<string, unknown>> {
       DRY_RUN: CONFIG.DRY_RUN,
       LLM_EXIT_ENABLED: CONFIG.LLM_EXIT_ENABLED,
     },
+    exitSettings: runtimeSettings.exit,
     stats: { ...stats, now: Date.now() },
     positions: positions.map(serializePosition),
     alerts,

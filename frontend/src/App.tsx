@@ -85,7 +85,11 @@ export default function App() {
         </main>
 
         {/* Fixed config strip — replaces the old ConfigCard */}
-        <BottomConfigStrip config={state?.config} botUsername={state?.telegramBotUsername} />
+        <BottomConfigStrip
+          config={state?.config}
+          exitSettings={state?.exitSettings}
+          botUsername={state?.telegramBotUsername}
+        />
       </div>
     </TooltipProvider>
   );

@@ -1,4 +1,4 @@
-import { CONFIG, SETTABLE_SPECS, setConfigValue, toggleConfigValue, type SettableKey } from "./config.js";
+import { CONFIG, SETTABLE_SPECS, setConfigValue as setConfigValueRaw, toggleConfigValue as toggleConfigValueRaw, type SetConfigResult, type SettableKey } from "./config.js";
 import logger from "./logger.js";
 import { getPositions, forceClosePosition, getStats, getClosedTrades, type ClosedTrade } from "./positionManager.js";
 import { getWalletSolBalance, getWalletAddress } from "./jupClient.js";
@@ -27,6 +27,15 @@ import {
 } from "./updateManager.js";
 import { formatDoctorHtml, runDoctor, type DoctorReport } from "./doctor.js";
 import type { Position } from "./types.js";
+import {
+  formatTpTargets,
+  getRuntimeSettings,
+  parseTpTargetsInput,
+  setExitStrategy,
+  setTpTargets,
+  syncRuntimeSettingsFromConfig,
+  type ExitStrategyMode,
+} from "./settingsStore.js";
 
 type Update = {
   update_id: number;
@@ -47,6 +56,90 @@ type Update = {
 // remember which setting key the user is responding to. Keyed by the prompt
 // message_id so the user's reply (which references it) can be matched back.
 const pendingEdits = new Map<number, SettableKey>();
+type ExitTargetEdit = { kind: "tp_targets" };
+const pendingExitEdits = new Map<number, ExitTargetEdit>();
+
+const EXIT_STRATEGY_LABELS: Record<ExitStrategyMode, string> = {
+  trail: "🌙 Trail",
+  fixed_tp: "🎯 Fixed TP",
+  tp_ladder: "🪜 TP Ladder",
+  llm_managed: "🧠 LLM Managed",
+};
+
+function setConfigValue(key: SettableKey, raw: string): SetConfigResult {
+  const result = setConfigValueRaw(key, raw);
+  if (result.ok) syncRuntimeSettingsFromConfig();
+  return result;
+}
+
+function toggleConfigValue(key: SettableKey): SetConfigResult {
+  const result = toggleConfigValueRaw(key);
+  if (result.ok) syncRuntimeSettingsFromConfig();
+  return result;
+}
+
+function strategySummaryLines(): string[] {
+  const settings = getRuntimeSettings();
+  const strategy = settings.exit.profitStrategy;
+  const targets = strategy.type === "fixed_tp"
+    ? formatTpTargets([{ pnlPct: strategy.fixedTargetPct, sellPct: 1 }])
+    : formatTpTargets(strategy.ladderTargets);
+  return [
+    `Strategy: <b>${EXIT_STRATEGY_LABELS[strategy.type]}</b>`,
+    `TP targets: <code>${escapeHtml(targets)}</code>`,
+  ];
+}
+
+function formatRiskSummary(): string {
+  const settings = getRuntimeSettings();
+  const arm = `${(settings.exit.trail.armPct * 100).toFixed(0)}%`;
+  const trail = `${(settings.exit.trail.trailPct * 100).toFixed(0)}%`;
+  const stop = `${(settings.exit.risk.stopPct * 100).toFixed(0)}%`;
+  const hold = SETTABLE_SPECS.MAX_HOLD_SECS.display(settings.exit.risk.maxHoldSecs);
+  return `Arm ${arm} · Trail ${trail} · Stop ${stop} · Max hold ${hold}`;
+}
+
+async function promptForTpTargets(chatId: number): Promise<void> {
+  const resp = await tgPost("sendMessage", {
+    chat_id: chatId,
+    text:
+      "Reply with TP targets as <b>profit:close</b> pairs.\n" +
+      "Example: <code>50:25,100:25,200:25</code>\n" +
+      `Current: <code>${escapeHtml(formatTpTargets(getRuntimeSettings().exit.profitStrategy.ladderTargets))}</code>`,
+    parse_mode: "HTML",
+    reply_markup: { force_reply: true, selective: true },
+  }) as { ok?: boolean; result?: { message_id?: number } };
+
+  const promptId = resp?.result?.message_id;
+  if (typeof promptId === "number") {
+    pendingExitEdits.set(promptId, { kind: "tp_targets" });
+    setTimeout(() => pendingExitEdits.delete(promptId), 5 * 60_000).unref?.();
+  }
+}
+
+async function applyTpTargets(chatId: number, raw: string): Promise<void> {
+  const parsed = parseTpTargetsInput(raw);
+  if (!parsed.ok) {
+    await tgPost("sendMessage", {
+      chat_id: chatId,
+      text: `❌ Could not update TP targets: ${escapeHtml(parsed.error)}`,
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  const targets = parsed.value;
+  setTpTargets(targets);
+
+  await tgPost("sendMessage", {
+    chat_id: chatId,
+    text:
+      `✅ <b>TP targets updated</b>\n` +
+      `<code>${escapeHtml(formatTpTargets(targets))}</code>`,
+    parse_mode: "HTML",
+  });
+  logger.info({ targets }, "[settings] tp targets updated via telegram");
+}
 
 function enabled(): boolean {
   return Boolean(CONFIG.TELEGRAM_BOT_TOKEN && CONFIG.TELEGRAM_CHAT_ID);
@@ -100,7 +193,7 @@ function fmtUptime(bootAt: number): string {
 }
 
 // ---------------------------------------------------------------------------
-// Settings menu — list editable values, with [Edit]/[Toggle] buttons.
+// Settings menus — structured hub, exit strategy submenu, and legacy flat view.
 // ---------------------------------------------------------------------------
 const SETTINGS_LABELS: Record<SettableKey, string> = {
   BUY_SIZE_SOL:             "💰 Buy size",
@@ -118,6 +211,87 @@ const SETTINGS_LABELS: Record<SettableKey, string> = {
 };
 
 async function sendSettingsMenu(chatId: number): Promise<void> {
+  const summary = [
+    ...strategySummaryLines(),
+    `Risk: <code>${escapeHtml(formatRiskSummary())}</code>`,
+  ];
+  await tgPost("sendMessage", {
+    chat_id: chatId,
+    text:
+      `<b>⚙️ Settings</b>\n\n` +
+      `${summary.join("\n")}\n\n` +
+      `Choose a section to edit.`,
+    parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "🎯 Exit Strategy", callback_data: "settings:exit" }, { text: "🛡 Risk Controls", callback_data: "settings:risk" }],
+        [{ text: "🧰 Live Settings", callback_data: "settings:live" }, { text: "🏠 Dashboard", callback_data: "menu:start" }],
+      ],
+    },
+  });
+}
+
+async function sendExitStrategyMenu(chatId: number): Promise<void> {
+  const settings = getRuntimeSettings();
+  const llmHint = CONFIG.LLM_EXIT_ENABLED ? "LLM is currently on." : "LLM is currently off.";
+  const ladderHint = settings.exit.profitStrategy.type === "tp_ladder"
+    ? "Ladder is active."
+    : settings.exit.profitStrategy.type === "fixed_tp"
+      ? "Fixed TP is active."
+      : "TP targets are ready when you choose a TP strategy.";
+  await tgPost("sendMessage", {
+    chat_id: chatId,
+    text:
+      `<b>🎯 Exit Strategy</b>\n\n` +
+      `${strategySummaryLines().join("\n")}\n` +
+      `<i>${escapeHtml(llmHint)} ${escapeHtml(ladderHint)}</i>\n\n` +
+      `Pick the strategy you want to run.`,
+    parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: `${settings.exit.profitStrategy.type === "trail" ? "✅ " : ""}🌙 Trail`, callback_data: "settings:strategy:trail" },
+          { text: `${settings.exit.profitStrategy.type === "fixed_tp" ? "✅ " : ""}🎯 Fixed TP`, callback_data: "settings:strategy:fixed_tp" },
+        ],
+        [
+          { text: `${settings.exit.profitStrategy.type === "tp_ladder" ? "✅ " : ""}🪜 TP Ladder`, callback_data: "settings:strategy:tp_ladder" },
+          { text: `${settings.exit.profitStrategy.type === "llm_managed" ? "✅ " : ""}🧠 LLM Managed`, callback_data: "settings:strategy:llm_managed" },
+        ],
+        [{ text: "✏️ Edit TP Targets", callback_data: "settings:tp:edit" }],
+        [{ text: "↩️ Back", callback_data: "menu:settings" }],
+      ],
+    },
+  });
+}
+
+async function sendRiskControlsMenu(chatId: number): Promise<void> {
+  await tgPost("sendMessage", {
+    chat_id: chatId,
+    text:
+      `<b>🛡 Risk Controls</b>\n\n` +
+      `<code>${escapeHtml(formatRiskSummary())}</code>\n\n` +
+      `These map to the live trade guardrails.`,
+    parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "⚡ Arm", callback_data: "edit:ARM_PCT" },
+          { text: "📉 Trail", callback_data: "edit:TRAIL_PCT" },
+        ],
+        [
+          { text: "🛑 Stop", callback_data: "edit:STOP_PCT" },
+          { text: "⏱ Max Hold", callback_data: "edit:MAX_HOLD_SECS" },
+        ],
+        [
+          { text: "🌙 Moonbag", callback_data: "edit:MOONBAG_PCT" },
+          { text: "↩️ Back", callback_data: "menu:settings" },
+        ],
+      ],
+    },
+  });
+}
+
+async function sendAllSettingsMenu(chatId: number): Promise<void> {
   const keys = Object.keys(SETTABLE_SPECS) as SettableKey[];
   const lines = keys.map((k) => {
     const spec = SETTABLE_SPECS[k];
@@ -135,7 +309,10 @@ async function sendSettingsMenu(chatId: number): Promise<void> {
 
   await tgPost("sendMessage", {
     chat_id: chatId,
-    text: `<b>⚙️ Settings</b>\n\n${lines.join("\n")}\n\n<i>Changes save to .env and apply live — no restart needed.</i>`,
+    text:
+      `<b>🧰 Live Settings</b>\n\n` +
+      `${lines.join("\n")}\n\n` +
+      `<i>Trading changes sync to state/settings.json and apply live - no restart needed.</i>`,
     parse_mode: "HTML",
     reply_markup: { inline_keyboard: buttons },
   });
@@ -186,7 +363,7 @@ async function applyEdit(chatId: number, key: SettableKey, raw: string): Promise
   const v = (CONFIG as unknown as Record<string, unknown>)[key] as number | boolean;
   await tgPost("sendMessage", {
     chat_id: chatId,
-    text: `✅ <b>${SETTINGS_LABELS[key]}</b> → <b>${escapeHtml(SETTABLE_SPECS[key].display(v))}</b>\n<i>Saved to .env. Live now.</i>`,
+    text: `✅ <b>${SETTINGS_LABELS[key]}</b> → <b>${escapeHtml(SETTABLE_SPECS[key].display(v))}</b>\n<i>Saved to state/settings.json. Live now.</i>`,
     parse_mode: "HTML",
   });
   logger.info({ key, value: v }, "[settings] updated via telegram");
@@ -275,6 +452,12 @@ async function handleCallback(cq: NonNullable<Update["callback_query"]>): Promis
     return;
   }
 
+  if (data === "menu:start") {
+    await tgPost("answerCallbackQuery", { callback_query_id: cq.id });
+    await sendStartMenu(chatId);
+    return;
+  }
+
   if (data === "menu:refresh") {
     await tgPost("answerCallbackQuery", { callback_query_id: cq.id, text: "Refreshed" });
     await sendStartMenu(chatId);
@@ -284,6 +467,46 @@ async function handleCallback(cq: NonNullable<Update["callback_query"]>): Promis
   if (data === "menu:settings") {
     await tgPost("answerCallbackQuery", { callback_query_id: cq.id });
     await sendSettingsMenu(chatId);
+    return;
+  }
+
+  if (data === "settings:exit") {
+    await tgPost("answerCallbackQuery", { callback_query_id: cq.id });
+    await sendExitStrategyMenu(chatId);
+    return;
+  }
+
+  if (data === "settings:risk") {
+    await tgPost("answerCallbackQuery", { callback_query_id: cq.id });
+    await sendRiskControlsMenu(chatId);
+    return;
+  }
+
+  if (data === "settings:live") {
+    await tgPost("answerCallbackQuery", { callback_query_id: cq.id });
+    await sendAllSettingsMenu(chatId);
+    return;
+  }
+
+  if (data === "settings:tp:edit") {
+    await tgPost("answerCallbackQuery", { callback_query_id: cq.id });
+    await promptForTpTargets(chatId);
+    return;
+  }
+
+  if (data.startsWith("settings:strategy:")) {
+    const mode = data.slice("settings:strategy:".length) as ExitStrategyMode;
+    if (mode !== "trail" && mode !== "fixed_tp" && mode !== "tp_ladder" && mode !== "llm_managed") {
+      await tgPost("answerCallbackQuery", { callback_query_id: cq.id, text: "Unknown strategy" });
+      return;
+    }
+    setExitStrategy(mode);
+    await tgPost("answerCallbackQuery", {
+      callback_query_id: cq.id,
+      text: `${EXIT_STRATEGY_LABELS[mode]} selected`,
+    });
+    await sendExitStrategyMenu(chatId);
+    logger.info({ strategy: mode }, "[settings] exit strategy updated via telegram");
     return;
   }
 
@@ -784,7 +1007,7 @@ async function handleSetupStatus(chatId: number): Promise<void> {
 // ---------------------------------------------------------------------------
 // /backtest — run a backtest on ~100 hot-token Solana candidates, present top 5
 // combos vs the user's current config, and let them adopt any row with a
-// tap (writes live to .env via setConfigValue, no restart needed).
+// tap (writes live to state/settings.json via setConfigValue, no restart needed).
 // ---------------------------------------------------------------------------
 let backtestInFlight = false;
 
@@ -1170,7 +1393,7 @@ async function handleAdopt(chatId: number, data: string): Promise<void> {
     text:
       `⚠️ <b>Confirm adopt? (${mode})</b>\n\n` +
       `<pre>${diffLines.map(l => escapeHtml(l)).join("\n")}</pre>\n` +
-      `Applies live, writes to .env. No restart needed.` +
+      `Applies live, writes to state/settings.json. No restart needed.` +
       hybridExtra,
     parse_mode: "HTML",
     reply_markup: {
@@ -1241,14 +1464,14 @@ async function handleAdoptConfirmed(chatId: number, data: string): Promise<void>
     summary.push(`MB_TIMEOUT: ${Math.round(parseFloat(parts[7]!))}m`);
   }
   const llmWarning = mode === "hybrid" && CONFIG.LLM_EXIT_ENABLED
-    ? "\n\n⚠️ <b>Reminder:</b> LLM is ON — MOONBAG params saved to .env but won't fire until you set LLM_EXIT_ENABLED=false."
+    ? "\n\n⚠️ <b>Reminder:</b> LLM is ON — MOONBAG params are saved but won't fire until you switch out of LLM Managed."
     : "";
   await tgPost("sendMessage", {
     chat_id: chatId,
     text:
       `✅ <b>Adopted new config (${mode})</b>\n` +
       summary.join("\n") + "\n\n" +
-      `<i>Saved to .env and active on next tick. No restart needed.</i>` +
+      `<i>Saved to state/settings.json and active on next tick. No restart needed.</i>` +
       llmWarning,
     parse_mode: "HTML",
   });
@@ -1317,6 +1540,14 @@ export function startTelegramBot(): () => void {
 
           // Reply to a settings prompt? (force_reply messages have reply_to_message)
           const replyToId = u.message?.reply_to_message?.message_id;
+          if (replyToId !== undefined && pendingExitEdits.has(replyToId)) {
+            const prompt = pendingExitEdits.get(replyToId)!;
+            pendingExitEdits.delete(replyToId);
+            if (prompt.kind === "tp_targets") {
+              await applyTpTargets(chatId, text);
+            }
+            continue;
+          }
           if (replyToId !== undefined && pendingEdits.has(replyToId)) {
             const key = pendingEdits.get(replyToId)!;
             pendingEdits.delete(replyToId);
