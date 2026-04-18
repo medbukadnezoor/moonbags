@@ -1129,6 +1129,15 @@ async function consultOnePosition(position: Position): Promise<void> {
     });
   }
 
+  const settings = getRuntimeSettings();
+  const { profitStrategy } = settings.exit;
+  const isLadderActive = profitStrategy.type === "tp_ladder" && profitStrategy.ladderTargets.length > 0;
+  const originalHeld = position.originalTokensHeld ? BigInt(position.originalTokensHeld) : null;
+  const currentHeld = position.tokensHeld ? BigInt(position.tokensHeld) : null;
+  const remainingPct = originalHeld && currentHeld && originalHeld > 0n
+    ? Number(currentHeld) / Number(originalHeld)
+    : null;
+
   const ctx: LlmContext = {
     name: position.name,
     mint: position.mint,
@@ -1140,6 +1149,11 @@ async function consultOnePosition(position: Position): Promise<void> {
     currentTrailPct: position.dynamicTrailPct ?? CONFIG.TRAIL_PCT,
     ceilingTrailPct: CONFIG.TRAIL_PCT,           // user-configured default is the max trail allowed
     holdSecs: Math.floor((Date.now() - position.openedAt) / 1000),
+    ...(isLadderActive && {
+      tpTargets: profitStrategy.ladderTargets,
+      tpTargetsHit: position.tpTargetsHit ?? [],
+      positionSizeRemainingPct: remainingPct ?? undefined,
+    }),
   };
 
   const snapshot = await getPositionSnapshot(position.mint, 30).catch((err) => {

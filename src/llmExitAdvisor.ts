@@ -57,6 +57,8 @@ export type LlmDecision = {
   sellPct?: number;
 };
 
+export type LlmTpTarget = { pnlPct: number; sellPct: number };
+
 export type LlmContext = {
   name: string;
   mint: string;
@@ -68,6 +70,10 @@ export type LlmContext = {
   currentTrailPct: number;
   ceilingTrailPct: number;       // CONFIG.TRAIL_PCT — max trail the LLM may set
   holdSecs: number;
+  // TP ladder context — present when tp_ladder strategy is active alongside LLM.
+  tpTargets?: LlmTpTarget[];
+  tpTargetsHit?: number[];        // indices of targets already fired
+  positionSizeRemainingPct?: number; // fraction of original tokens still held (1.0 = no sells yet)
 };
 
 const EVIDENCE_KEYS = [
@@ -174,6 +180,16 @@ Your job is to choose ONE of four actions:
                       keeps running with existing trail/stop. Use to lock profit
                       on a runner while staying exposed for more upside.
   - "exit_now"      — sell the entire position immediately
+
+TP LADDER AWARENESS:
+If the position payload contains a \`tp_ladder_state\` block, the user has a
+mechanical TP ladder running in parallel. Factor this in:
+  - \`targets\` shows the configured sell tiers (pnlPct → sellPct).
+  - \`targets_hit\` lists which tier indices have already fired and locked profit.
+  - \`position_size_remaining_pct\` shows what fraction of the original is still held.
+  Do NOT recommend partial_exit for a tier that has already fired (already captured).
+  Do NOT partial_exit if the remaining position is small enough that exit_now is cleaner.
+  If all tiers have fired and the trailing stop will handle the remainder, prefer hold.
 
 You MUST cite exact evidence fact keys in cited_facts and in the reason text.
 Example: "Facts: bundlerDistribution, volumeCliff." If the evidence gate says
@@ -808,6 +824,20 @@ async function buildUserPrompt(ctx: LlmContext, snapshot: PositionSnapshot): Pro
     trends: buildTrendsPayload(ctx.mint),
     recentDecisions: buildRecentDecisions(ctx.mint),
   };
+  // TP ladder state — inject when ladder is active so LLM avoids double-selling tiers.
+  if (ctx.tpTargets && ctx.tpTargets.length > 0) {
+    payload.tp_ladder_state = {
+      targets: ctx.tpTargets.map((t, i) => ({
+        index: i,
+        pnlPct: fmtNum(t.pnlPct * 100, 1),
+        sellPct: fmtNum(t.sellPct * 100, 1),
+        fired: (ctx.tpTargetsHit ?? []).includes(i),
+      })),
+      position_size_remaining_pct: ctx.positionSizeRemainingPct != null
+        ? fmtNum(ctx.positionSizeRemainingPct * 100, 1)
+        : null,
+    };
+  }
   // Only inject track record once we have enough closed trades to be meaningful.
   if (trackRecord) payload.recent_track_record = trackRecord;
   if (similarCases) payload.similar_cases = similarCases;
