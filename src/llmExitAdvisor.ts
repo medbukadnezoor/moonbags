@@ -77,12 +77,33 @@ export type LlmContext = {
 };
 
 const EVIDENCE_KEYS = [
+  // ── Bearish / reactive ──────────────────────────────────────────────────
   "bundlerDistribution",
   "smartMoneySelling",
   "topHolderCapitulation",
   "volumeCliff",
   "roundTripRisk",
+  // ── Proactive / overbought (sell-into-strength signals) ─────────────────
+  "priceAcceleration",   // single 1m candle parabolic move detected
+  "volumeBlowoff",       // 5m volume ≥ 3× hourly per-5m average
+  "txRatioBurst",        // 5m tx count ≥ 2× hourly per-5m average
+  "pctFromAthSpike",     // price within 5% of all-time high on a +100% winner
 ] as const;
+
+const BEARISH_KEYS = [
+  "bundlerDistribution",
+  "smartMoneySelling",
+  "topHolderCapitulation",
+  "volumeCliff",
+  "roundTripRisk",
+] as const satisfies readonly (typeof EVIDENCE_KEYS)[number][];
+
+const PROACTIVE_KEYS = [
+  "priceAcceleration",
+  "volumeBlowoff",
+  "txRatioBurst",
+  "pctFromAthSpike",
+] as const satisfies readonly (typeof EVIDENCE_KEYS)[number][];
 
 type EvidenceKey = typeof EVIDENCE_KEYS[number];
 
@@ -95,6 +116,7 @@ type EvidenceFact = {
 
 type EvidenceGate = {
   activeBearishKeys: EvidenceKey[];
+  activeProactiveKeys: EvidenceKey[];
   partialExitAllowed: boolean;
   exitNowAllowed: boolean;
   tightenAllowed: boolean;
@@ -134,9 +156,26 @@ For each open position you are given:
     holders' avg PnL and trend, liquidity pools, token risk profile, recent
     smart-money signals, and a compact 1m + 5m kline summary.
   - an \`evidence\` block of deterministic facts. Treat this as the source of
-    truth for aggressive actions. The exact fact keys are:
+    truth for aggressive actions. Facts come in two categories:
+
+    BEARISH (reactive — wait for confirmation of reversal):
     \`bundlerDistribution\`, \`smartMoneySelling\`, \`topHolderCapitulation\`,
-    \`volumeCliff\`, and \`roundTripRisk\`.
+    \`volumeCliff\`, \`roundTripRisk\`.
+
+    PROACTIVE (overbought — sell INTO strength before the reversal):
+    \`priceAcceleration\`  — single 1m candle body ≥ 35% or wick ≥ 50% on a
+                             +100% winner. Classic blow-off extension.
+    \`volumeBlowoff\`      — current 5m volume ≥ 3× the per-5m hourly average.
+                             Volume climax; retail/FOMO chase near the top.
+    \`txRatioBurst\`       — 5m transaction count ≥ 2× the per-5m hourly average.
+                             Retail crowd piling in — a late-cycle FOMO surge.
+    \`pctFromAthSpike\`    — token is within 5% of its all-time high while you
+                             are up 100%+. ATH is the strongest resistance level.
+
+    Proactive facts fire while the price is STILL RISING. They signal that the
+    move is exhausting itself. When these fire, the correct action is to capture
+    profit NOW, before the reversal is confirmed by on-chain data. Do not wait
+    for bearish confirmation when the blow-off pattern is active.
   - a \`trends\` block showing how each signal has EVOLVED over the last ~5
     snapshots (oldest → newest, spanning ~2 minutes). Use it to distinguish:
       * ACCELERATING bullish (smart money + volume both climbing): don't tighten
@@ -295,7 +334,7 @@ const SUBMIT_DECISION_TOOL = {
             enum: [...EVIDENCE_KEYS],
           },
           description:
-            "Exact deterministic evidence fact keys relied on for this decision. Use only these keys: bundlerDistribution, smartMoneySelling, topHolderCapitulation, volumeCliff, roundTripRisk.",
+            "Exact deterministic evidence fact keys relied on for this decision. Bearish keys: bundlerDistribution, smartMoneySelling, topHolderCapitulation, volumeCliff, roundTripRisk. Proactive keys: priceAcceleration, volumeBlowoff, txRatioBurst, pctFromAthSpike.",
         },
         new_trail_pct: {
           type: "number",
@@ -454,6 +493,9 @@ function computeEvidence(ctx: LlmContext, snapshot: PositionSnapshot): EvidenceP
   const smartMoney = snapshot.smartMoney;
   const holders = snapshot.topHolders;
   const momentum = snapshot.momentum;
+  const isSignificantWinner = ctx.pnlPct >= 1.0;  // position up 100%+
+
+  // ── Bearish / reactive facts ─────────────────────────────────────────────
 
   const bundlerSellRatio = bundlers.buyVolumeSol > 0
     ? bundlers.sellVolumeSol / bundlers.buyVolumeSol
@@ -485,6 +527,48 @@ function computeEvidence(ctx: LlmContext, snapshot: PositionSnapshot): EvidenceP
     ctx.peakPnlPct >= 0.5 &&
     ctx.pnlPct <= 0.1 &&
     ctx.drawdownFromPeakPct >= Math.min(0.5, Math.max(0.25, ctx.currentTrailPct * 0.75));
+
+  // ── Proactive / overbought facts (sell-into-strength) ────────────────────
+
+  // priceAcceleration: single confirmed 1m candle body ≥ 35% or upper wick ≥ 50%
+  // while already a significant winner — indicates parabolic blow-off extension.
+  const recentCandles = snapshot.kline1m.slice(-5).filter(c => c.confirmed);
+  const maxBodyMove = recentCandles.length > 0
+    ? Math.max(...recentCandles.map(c => c.open > 0 ? (c.close - c.open) / c.open : 0))
+    : 0;
+  const maxWickMove = recentCandles.length > 0
+    ? Math.max(...recentCandles.map(c => c.open > 0 ? (c.high - c.open) / c.open : 0))
+    : 0;
+  const priceAcceleration =
+    isSignificantWinner &&
+    (maxBodyMove >= 0.35 || maxWickMove >= 0.50);
+
+  // volumeBlowoff: current 5m volume ≥ 3× the per-5m average derived from 1h.
+  // Opposite of volumeCliff — a volume CLIMAX signal.
+  const vol5mAvg = (momentum?.volume1h ?? 0) > 0 ? momentum!.volume1h / 12 : 0;
+  const volumeBlowoffThreshold = vol5mAvg * 3;
+  const volumeBlowoff =
+    isSignificantWinner &&
+    vol5mAvg > 0 &&
+    (momentum?.volume5m ?? 0) >= volumeBlowoffThreshold;
+
+  // txRatioBurst: 5m tx count ≥ 2× the per-5m average from 1h — retail FOMO climax.
+  const txs5mAvg = (momentum?.txs1h ?? 0) > 0 ? momentum!.txs1h / 12 : 0;
+  const txRatioBurstThreshold = txs5mAvg * 2;
+  const txRatioBurst =
+    isSignificantWinner &&
+    txs5mAvg > 0 &&
+    (momentum?.txs5m ?? 0) >= txRatioBurstThreshold;
+
+  // pctFromAthSpike: token is within 5% of its all-time high while position is up 100%+.
+  // ATH is strong resistance; a large winner trading at ATH is primed for reversal.
+  const pctFromAth = momentum?.pctFromAth ?? -Infinity;
+  const pctFromAthSpike =
+    isSignificantWinner &&
+    Number.isFinite(pctFromAth) &&
+    pctFromAth >= -5;
+
+  // ── Assemble facts Record ────────────────────────────────────────────────
 
   const facts: Record<EvidenceKey, EvidenceFact> = {
     bundlerDistribution: fact(
@@ -553,34 +637,109 @@ function computeEvidence(ctx: LlmContext, snapshot: PositionSnapshot): EvidenceP
         currentTrailPct: fmtNum(ctx.currentTrailPct * 100, 2),
       },
     ),
+    priceAcceleration: fact(
+      "priceAcceleration",
+      priceAcceleration,
+      priceAcceleration
+        ? `Parabolic 1m candle detected on a +${fmtNum(ctx.pnlPct * 100, 0)}% winner: max body +${fmtNum(maxBodyMove * 100, 0)}%, max wick +${fmtNum(maxWickMove * 100, 0)}% in last 5 candles.`
+        : "No parabolic single-candle move detected in the last 5 confirmed 1m candles.",
+      {
+        maxBodyMovePct: fmtNum(maxBodyMove * 100, 1),
+        maxWickMovePct: fmtNum(maxWickMove * 100, 1),
+        recentCandleCount: recentCandles.length,
+        pnlPct: fmtNum(ctx.pnlPct * 100, 1),
+      },
+    ),
+    volumeBlowoff: fact(
+      "volumeBlowoff",
+      volumeBlowoff,
+      volumeBlowoff
+        ? `Volume climax: 5m volume $${fmtNum(momentum?.volume5m ?? 0, 0)} is ${fmtNum(vol5mAvg > 0 ? (momentum?.volume5m ?? 0) / vol5mAvg : 0, 1)}× the hourly per-5m average ($${fmtNum(vol5mAvg, 0)}).`
+        : "5m volume is not elevated enough to indicate a volume climax.",
+      {
+        volume5mUsd: fmtNum(momentum?.volume5m ?? 0, 0),
+        vol5mAvgUsd: fmtNum(vol5mAvg, 0),
+        multiplier: fmtNum(vol5mAvg > 0 ? (momentum?.volume5m ?? 0) / vol5mAvg : 0, 2),
+        thresholdUsd: fmtNum(volumeBlowoffThreshold, 0),
+      },
+    ),
+    txRatioBurst: fact(
+      "txRatioBurst",
+      txRatioBurst,
+      txRatioBurst
+        ? `Transaction burst: ${momentum?.txs5m ?? 0} txs in last 5m vs ${fmtNum(txs5mAvg, 0)} hourly average — retail FOMO climax.`
+        : "Transaction rate is not elevated enough to indicate a retail burst.",
+      {
+        txs5m: momentum?.txs5m ?? 0,
+        txs5mAvg: fmtNum(txs5mAvg, 1),
+        txs1h: momentum?.txs1h ?? 0,
+        thresholdTxs: fmtNum(txRatioBurstThreshold, 0),
+      },
+    ),
+    pctFromAthSpike: fact(
+      "pctFromAthSpike",
+      pctFromAthSpike,
+      pctFromAthSpike
+        ? `Token is ${Math.abs(pctFromAth).toFixed(1)}% from its all-time high while position is up ${fmtNum(ctx.pnlPct * 100, 0)}% — ATH resistance zone.`
+        : "Token is not near its all-time high.",
+      {
+        pctFromAth: fmtNum(pctFromAth, 2),
+        pnlPct: fmtNum(ctx.pnlPct * 100, 1),
+      },
+    ),
   };
 
-  const activeBearishKeys = EVIDENCE_KEYS.filter((key) => facts[key].active);
-  const activeCount = activeBearishKeys.length;
-  const partialExitAllowed =
+  // ── Gate logic ───────────────────────────────────────────────────────────
+
+  const activeBearishKeys = BEARISH_KEYS.filter((key) => facts[key].active);
+  const activeProactiveKeys = PROACTIVE_KEYS.filter((key) => facts[key].active);
+  const bearishCount = activeBearishKeys.length;
+  const proactiveCount = activeProactiveKeys.length;
+
+  // Bearish path (existing): 2+ bearish facts including an anchor fact
+  const bearishPartialAllowed =
     ctx.peakPnlPct >= 1 &&
-    activeCount >= 2 &&
+    bearishCount >= 2 &&
     (facts.bundlerDistribution.active || facts.volumeCliff.active || facts.roundTripRisk.active);
+
+  // Proactive path: 2+ proactive signals on a significant winner, OR 1 proactive + 1 bearish
+  const proactivePartialAllowed =
+    isSignificantWinner &&
+    ctx.peakPnlPct >= 1 &&
+    (proactiveCount >= 2 || (proactiveCount >= 1 && bearishCount >= 1));
+
+  const partialExitAllowed = bearishPartialAllowed || proactivePartialAllowed;
+
   const exitNowAllowed =
-    activeCount >= 3 ||
-    (facts.roundTripRisk.active && activeCount >= 2 && ctx.pnlPct <= 0.1);
-  const tightenAllowed = activeCount >= 2;
+    bearishCount >= 3 ||
+    (facts.roundTripRisk.active && bearishCount >= 2 && ctx.pnlPct <= 0.1) ||
+    (proactiveCount >= 3 && isSignificantWinner) ||
+    (proactiveCount >= 2 && bearishCount >= 1 && isSignificantWinner);
+
+  const tightenAllowed =
+    bearishCount >= 2 ||
+    (proactiveCount >= 2 && bearishCount >= 1);
 
   const reasons: string[] = [];
   if (!partialExitAllowed) {
-    reasons.push("partial_exit requires peakPnlPct >= +100% and at least two active evidence facts.");
+    reasons.push(
+      "partial_exit requires peakPnlPct >= +100% and either: (a) 2+ bearish facts with an anchor fact, or (b) 2+ proactive facts on a +100% winner, or (c) 1 proactive + 1 bearish on a +100% winner.",
+    );
   }
   if (!exitNowAllowed) {
-    reasons.push("exit_now requires at least three active evidence facts, or roundTripRisk plus another active fact near flat PnL.");
+    reasons.push(
+      "exit_now requires: 3+ bearish facts, or roundTripRisk+2 bearish near flat, or 3+ proactive facts on a +100% winner, or 2+ proactive + 1 bearish on a +100% winner.",
+    );
   }
   if (!tightenAllowed) {
-    reasons.push("tightening requires at least two active evidence facts.");
+    reasons.push("tightening requires 2+ bearish facts, or 2+ proactive + 1 bearish.");
   }
 
   return {
     facts,
     gate: {
       activeBearishKeys,
+      activeProactiveKeys,
       partialExitAllowed,
       exitNowAllowed,
       tightenAllowed,
@@ -957,7 +1116,7 @@ function blockDecision(
     action: "hold",
     reason,
     citedFacts: decision.citedFacts,
-    evidenceKeys: evidence.gate.activeBearishKeys,
+    evidenceKeys: [...evidence.gate.activeBearishKeys, ...evidence.gate.activeProactiveKeys],
     gate: { ...evidence.gate, blockedAction },
   };
 }
@@ -968,7 +1127,7 @@ function applyEvidenceGate(
   evidence: EvidencePacket,
 ): LlmDecision {
   const gate = evidence.gate;
-  const active = gate.activeBearishKeys;
+  const active = [...gate.activeBearishKeys, ...gate.activeProactiveKeys];
   const factText = active.length > 0 ? active.join(", ") : "none";
 
   if (decision.action === "partial_exit" && !gate.partialExitAllowed) {
@@ -1015,7 +1174,7 @@ function applyEvidenceGate(
     );
   }
 
-  return { ...decision, evidenceKeys: active, gate };
+  return { ...decision, evidenceKeys: [...gate.activeBearishKeys, ...gate.activeProactiveKeys], gate };
 }
 
 function parseDecision(
