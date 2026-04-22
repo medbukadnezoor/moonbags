@@ -205,17 +205,17 @@ const RECENT_REJECTION_CAP = 20;
 
 const DEFAULT_SETTINGS: GmgnSettings = {
   enabled: true,
-  pollMs: 60_000,
+  pollMs: 30_000,
   mode: "watch",
   sourceMode: "scg_only",
   chains: ["sol"],
   trending: {
-    // [TRENDING-DISABLED 2026-04-22] /v1/market/rank surfaces tokens already
-    // in the top-10 by volume — by definition post-pump. Trigger gate's
-    // `minScans=2` adds 60-120s further lag. Wrong lens for the early-buy
-    // strategy this bot targets. Re-enable here only if the strategy pivots
-    // to momentum-continuation plays.
-    enabled: false,
+    // [TRENDING-ENABLED 2026-04-22] /v1/market/rank returns full token
+    // profiles (holder_count, smart_degen_count, renowned_count), so
+    // trending seeds pass the baseline filter without requiring upfront
+    // enrichment. Deep-dive via /v1/token/info + /v1/token/security is
+    // invoked just before emit to reconfirm the filters.
+    enabled: true,
     interval: "1h",
     limit: 10,
     orderBy: "volume",
@@ -224,7 +224,8 @@ const DEFAULT_SETTINGS: GmgnSettings = {
     platforms: [],
   },
   trenches: {
-    enabled: true,
+    // Gated off 2026-04-22 — kept intact for future re-enable.
+    enabled: false,
     limit: 10,
     types: ["new_creation", "near_completion", "completed"],
     launchpadPlatforms: ["Pump.fun", "pump_mayhem", "letsbonk"],
@@ -233,7 +234,11 @@ const DEFAULT_SETTINGS: GmgnSettings = {
     sortBy: "smart_degen_count",
   },
   signal: {
-    enabled: true,
+    // Gated off 2026-04-22 — /v1/market/token_signal rows miss
+    // holder_count + smart_degen_count, so signal seeds always failed
+    // the baseline filter. Re-enable after the deep-dive pipeline is
+    // proven on trending seeds.
+    enabled: false,
     limit: 10,
     groups: [{ signal_type: [12] }],
   },
@@ -955,7 +960,12 @@ function baseSeedFromRow(source: GmgnSourceKind, chain: GmgnChain, row: GmgnRow)
   const priceUsd = parseNumber(getStringField(row, ["price", "priceUsd"]) ?? row.price ?? 0);
   const liquidityUsd = parseNumber(getStringField(row, ["liquidity", "liquidityUsd"]) ?? row.liquidity ?? 0);
   const holders = Math.round(parseNumber(getStringField(row, ["holder_count", "holders", "holderCount"]) ?? row.holder_count ?? 0));
-  const smartMoneyCount = Math.round(parseNumber(getStringField(row, ["smart_degen_count", "smartMoneyCount"]) ?? row.smart_degen_count ?? 0));
+  const smartMoneyCountRaw = Math.round(parseNumber(getStringField(row, ["smart_degen_count", "smartMoneyCount"]) ?? row.smart_degen_count ?? 0));
+  // A row returned from /v1/market/token_signal IS a smart-money buy by
+  // definition, so ensure smartMoneyCount is at least 1 even when the
+  // upstream row omits the count field. Left in place for when the
+  // "signal" source is re-enabled.
+  const smartMoneyCount = source === "signal" ? Math.max(1, smartMoneyCountRaw) : smartMoneyCountRaw;
   const kolCount = Math.round(parseNumber(getStringField(row, ["renowned_count", "kol_count", "kolCount"]) ?? row.renowned_count ?? 0));
   const sniperCount = Math.round(parseNumber(getStringField(row, ["sniper_count", "sniperCount"]) ?? row.sniper_count ?? 0));
   const bundlerPct = maybeRatioPct(getStringField(row, ["bundler_rate", "bundler_pct", "bundlerPct", "bundler_percent"]) ?? row.bundler_rate ?? 0);
@@ -1250,6 +1260,102 @@ async function fetchSeeds(settings: GmgnSettings): Promise<GmgnSignalCandidate[]
   return sortAndLimitSeeds(scored, settings.maxCandidatesPerPoll);
 }
 
+// Deep-dive enrichment: called just before a candidate would emit, after
+// baseline + trigger have already passed on the seed-level data. Pulls
+// /v1/token/info + /v1/token/security in parallel and fills ONLY missing
+// fields on the candidate (does not override richer seed data). Callers
+// should re-check baseline filters on the returned candidate.
+//
+// Returns null if either request throws — the safer behavior is to drop
+// the candidate rather than fire on partial data.
+async function deepDiveCandidate(seed: GmgnSignalCandidate): Promise<GmgnSignalCandidate | null> {
+  let info: Record<string, unknown> | null = null;
+  let security: Record<string, unknown> | null = null;
+  try {
+    const [infoRes, securityRes] = await Promise.all([
+      getTokenInfo(seed.chain, seed.mint),
+      getTokenSecurity(seed.chain, seed.mint),
+    ]);
+    info = (infoRes ?? null) as Record<string, unknown> | null;
+    security = (securityRes ?? null) as Record<string, unknown> | null;
+  } catch (err) {
+    logger.warn(
+      { err: (err as Error).message, mint: seed.mint, source: seed.source },
+      "[gmgn-source] deep-dive request failed — dropping candidate",
+    );
+    return null;
+  }
+
+  const next: GmgnSignalCandidate = { ...seed, sourceMeta: { ...seed.sourceMeta } };
+  const stat = (info && typeof info.stat === "object" && info.stat ? (info.stat as Record<string, unknown>) : {}) as Record<string, unknown>;
+
+  // holder_count → holders (only if seed had 0/missing)
+  if (!next.holders || next.holders <= 0) {
+    const holderCount = info ? parseNumber(info.holder_count) : 0;
+    if (holderCount > 0) next.holders = Math.round(holderCount);
+  }
+
+  // liquidity → liquidityUsd (only if missing)
+  if (!next.liquidityUsd || next.liquidityUsd <= 0) {
+    const liq = info ? parseNumber(info.liquidity) : 0;
+    if (liq > 0) next.liquidityUsd = liq;
+  }
+
+  // rug_ratio → rugRatio (only if missing or 0)
+  if (!next.rugRatio || next.rugRatio <= 0) {
+    const rug = security
+      ? parseNumber(security.rug_ratio)
+      : 0;
+    if (rug > 0) next.rugRatio = rug;
+  }
+
+  // top_10_holder_rate → top10Pct (only if missing)
+  if (!next.top10Pct || next.top10Pct <= 0) {
+    const t10 = parseNumber(
+      (security && (security.top_10_holder_rate ?? security.top10_holder_rate)) ??
+        stat.top_10_holder_rate ??
+        0,
+    );
+    if (t10 > 0) next.top10Pct = maybeRatioPct(t10);
+  }
+
+  // bundler_rate → bundlerPct (only if missing)
+  if (!next.bundlerPct || next.bundlerPct <= 0) {
+    const b = parseNumber(
+      (info && info.bundler_rate) ??
+        stat.top_bundler_trader_percentage ??
+        stat.bot_degen_rate ??
+        0,
+    );
+    if (b > 0) next.bundlerPct = maybeRatioPct(b);
+  }
+
+  // is_wash_trading → isWashTrading (only if not set)
+  if (!next.isWashTrading) {
+    const wash =
+      (info && getMaybeBool(info.is_wash_trading)) ??
+      (security && getMaybeBool(security.is_wash_trading)) ??
+      null;
+    if (wash != null) next.isWashTrading = wash;
+  }
+
+  next.sourceMeta = {
+    ...next.sourceMeta,
+    deepDive: {
+      info: info ?? null,
+      security: security ?? null,
+    },
+  };
+
+  // Refresh score + alert so /sources-status and downstream consumers
+  // see the enriched numbers.
+  next.score = scoreFromData(next);
+  next.alert = buildAlert(next);
+  next.alert.score = next.score;
+  next.alert.sourceMeta = next.sourceMeta;
+  return next;
+}
+
 async function processSeed(seed: GmgnSignalCandidate, settings: GmgnSettings): Promise<void> {
   settings = currentSettings();
   if (!settings.enabled) {
@@ -1305,9 +1411,29 @@ async function processSeed(seed: GmgnSignalCandidate, settings: GmgnSettings): P
     return;
   }
 
+  // Deep-dive: pull /v1/token/info + /v1/token/security once we know the
+  // candidate would otherwise fire. This backfills any fields missing
+  // from the seed (holders, liquidity, rug_ratio, top10, bundler,
+  // is_wash_trading) and gives us a last chance to reject bad tokens.
+  const enriched = await deepDiveCandidate(seed);
+  if (!enriched) {
+    reject(seed, seed.source, "deep-dive: request failed");
+    upsertWatchEntry(seed, "filtered", "deep-dive: request failed");
+    return;
+  }
+  // Reuse lastCandidate so /sources-status reflects the enriched numbers.
+  lastCandidate = enriched;
+  const deepDiveReason = maybeReject(enriched, "deep-dive");
+  if (deepDiveReason) {
+    const reason = `deep-dive: ${deepDiveReason}`;
+    reject(enriched, enriched.source, reason);
+    upsertWatchEntry(enriched, "filtered", reason);
+    return;
+  }
+
   candidatesAccepted++;
-  const alert = seed.alert;
-  markSignalMintAccepted(seed.mint, "gmgn");
+  const alert = enriched.alert;
+  markSignalMintAccepted(enriched.mint, "gmgn");
   recordAlertEvent({
     at: Date.now(),
     mint: alert.mint,
@@ -1317,10 +1443,10 @@ async function processSeed(seed: GmgnSignalCandidate, settings: GmgnSettings): P
     liquidity: alert.liquidity,
     action: "fired",
   });
-  upsertWatchEntry(seed, "accepted");
-  lastAcceptedCandidate = seed;
+  upsertWatchEntry(enriched, "accepted");
+  lastAcceptedCandidate = enriched;
   logger.info(
-    { mint: seed.mint, name: seed.name, score: seed.score, source: seed.source, chain: seed.chain },
+    { mint: enriched.mint, name: enriched.name, score: enriched.score, source: enriched.source, chain: enriched.chain },
     "[gmgn-source] firing GMGN candidate",
   );
   await Promise.resolve(onAcceptedCandidate?.(alert));
@@ -1391,17 +1517,16 @@ async function runCycle(): Promise<void> {
     for (const seed of seeds) {
       if (!shouldProcessSeed(seed)) continue;
       try {
-        const enriched = await enrichSeed(seed);
-        const reason = maybeReject(enriched, "live");
-        if (reason) {
-          reject(enriched, enriched.source, reason);
-          upsertWatchEntry(enriched, "filtered", reason);
-          continue;
-        }
-        await processSeed(enriched, settings);
+        // Trending seeds from /v1/market/rank include a full profile
+        // (holder_count, smart_degen_count, renowned_count, liquidity,
+        // etc.), so baseline can run directly against the seed. The
+        // deep-dive enrichment happens inside processSeed just before
+        // emit — this keeps API usage to ~2 calls per accepted
+        // candidate rather than per seed.
+        await processSeed(seed, settings);
       } catch (err) {
         lastError = (err as Error).message;
-        logger.warn({ err: lastError, mint: seed.mint, source: seed.source }, "[gmgn-source] candidate enrichment failed");
+        logger.warn({ err: lastError, mint: seed.mint, source: seed.source }, "[gmgn-source] candidate processing failed");
         upsertWatchEntry(seed, "filtered", lastError);
       }
     }
