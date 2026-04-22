@@ -1095,7 +1095,7 @@ async function handleSources(chatId: number, data?: string): Promise<string> {
     updateRuntimeSettings((draft) => {
       draft.signals.sourceMode = rawMode;
       draft.signals.okx.enabled = rawMode === "okx_watch" || rawMode === "hybrid" || rawMode === "okx_only";
-      draft.signals.gmgn.enabled = rawMode === "gmgn_watch" || rawMode === "gmgn_live" || rawMode === "gmgn_only";
+      draft.signals.gmgn.enabled = rawMode === "gmgn_watch" || rawMode === "gmgn_live" || rawMode === "gmgn_only" || rawMode === "hybrid";
     });
     await refreshSafeOkxSignalSource();
     await refreshSafeGmgnSignalSource();
@@ -1162,12 +1162,12 @@ async function handlePing(chatId: number): Promise<void> {
   const okxRunning = okxDiscovery.available && firstBoolean(okxDiscovery.status, [["running"]]) === true;
   const okxSession = okxDiscovery.available ? firstString(okxDiscovery.status, [["sessionId"]]) : null;
   if (okxRunning) {
-    lines.push(`${checkNum}. OKX onchainos: ✅ WSS session active${okxSession ? ` (${escapeHtml(okxSession.slice(0, 12))}…)` : ""}`);
+    lines.push(`${checkNum}. OKX signal stream (discovery): ✅ WSS session active${okxSession ? ` (${escapeHtml(okxSession.slice(0, 12))}…)` : ""}`);
   } else if (okxDiscovery.available) {
     const err = firstString(okxDiscovery.status, [["lastError"]]);
-    lines.push(`${checkNum}. OKX onchainos: ⚠️ session not running${err ? ` — <code>${escapeHtml(err)}</code>` : ""}`);
+    lines.push(`${checkNum}. OKX signal stream (discovery): ⚠️ session not running${err ? ` — <code>${escapeHtml(err)}</code>` : ""}`);
   } else {
-    lines.push(`${checkNum}. OKX onchainos: ❌ ${escapeHtml(okxDiscovery.error ?? "unavailable")}`);
+    lines.push(`${checkNum}. OKX signal stream (discovery): ❌ ${escapeHtml(okxDiscovery.error ?? "unavailable")}`);
   }
 
   // Check 3 — Telegram delivery. The reply itself is the proof.
@@ -1190,7 +1190,7 @@ async function handlePing(chatId: number): Promise<void> {
   const wssLastEventAgo = wss.lastEventAt ? formatAgo(Date.now() - wss.lastEventAt) : "never";
   const wssLastPollAgo = wss.lastPollAt ? formatAgo(Date.now() - wss.lastPollAt) : "never";
   lines.push("");
-  lines.push("<b>OKX open-position WSS</b>");
+  lines.push("<b>OKX price-feed WSS (open positions)</b>");
   lines.push(
     `• status: ${wss.enabled ? "enabled" : "disabled"} · ${wss.activeSessions}/${wss.watchedMints} sessions · last event ${wssLastEventAgo} · last poll ${wssLastPollAgo}`,
   );
