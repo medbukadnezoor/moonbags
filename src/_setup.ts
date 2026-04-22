@@ -223,6 +223,15 @@ async function main(): Promise<void> {
   if (okxPassphrase) collected.OKX_PASSPHRASE = okxPassphrase;
   else if (!okxPassphraseFromEnv) collected.OKX_PASSPHRASE = "";
 
+  console.log("");
+  console.log(gray("   Optional GMGN source scanner key — enables GMGN Watch/Live in /sources."));
+  console.log(`   Get one at:  ${blue("https://gmgn.ai/ai")}`);
+  const gmgnKeyFromEnv = existingEnv.match(/^GMGN_API_KEY=(.*)$/m)?.[1];
+  if (gmgnKeyFromEnv) console.log(`   ${dim(`current GMGN_API_KEY: ${gmgnKeyFromEnv.slice(0, 10)}...`)}`);
+  const gmgnKey = await ask(`   ${bold("GMGN_API_KEY")} ${dim("(blank to keep/skip)")}: `);
+  if (gmgnKey) collected.GMGN_API_KEY = gmgnKey;
+  else if (!gmgnKeyFromEnv) collected.GMGN_API_KEY = "";
+
   // 3. Jupiter API key
   section("Jupiter API key", 3);
   console.log(gray("   Jupiter Ultra provides swap routing (buy/sell execution)."));

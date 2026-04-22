@@ -42,6 +42,7 @@ export interface SignalMeta {
   rug_ratio: number;
   liq_trend: string;
   score: number;
+  source?: string;
 }
 
 export interface ScgAlertsResponse {

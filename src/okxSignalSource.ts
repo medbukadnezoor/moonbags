@@ -38,6 +38,10 @@ export type OkxSignalCandidate = {
 export type OkxSignalStatus = {
   enabled: boolean;
   mode: SourceMode;
+  liveFilter: {
+    minHolders: number;
+    walletTypes: number[];
+  };
   running: boolean;
   seeded: boolean;
   sessionId?: string;
@@ -47,6 +51,7 @@ export type OkxSignalStatus = {
   candidatesSeen: number;
   candidatesFiltered: number;
   candidatesAccepted: number;
+  lastRejectionReason?: string;
   recentRejections: Array<{ at: number; mint?: string; name?: string; reason: string }>;
   lastCandidate?: OkxSignalCandidate;
 };
@@ -109,6 +114,36 @@ function isModeEnabled(mode = currentMode()): boolean {
 
 function isLiveMode(mode = currentMode()): boolean {
   return mode === "hybrid" || mode === "okx_only";
+}
+
+function walletTypeLabel(type: number): string {
+  if (type === 1) return "Smart Money";
+  if (type === 2) return "KOL";
+  if (type === 3) return "Whale";
+  return `type ${type}`;
+}
+
+function candidateFilterRejection(candidate: OkxSignalCandidate): string | null {
+  const runtime = getRuntimeSettings();
+  const filter = runtime.signals.okx.entryFilter;
+  if (candidate.holders < filter.minHolders) {
+    return `OKX filter: holders ${candidate.holders.toLocaleString("en-US")} < ${filter.minHolders.toLocaleString("en-US")}`;
+  }
+  if (!filter.walletTypes.includes(candidate.walletType)) {
+    const allowed = filter.walletTypes.map(walletTypeLabel).join("/");
+    return `OKX filter: wallet type ${walletTypeLabel(candidate.walletType)} not ${allowed}`;
+  }
+  if (filter.minAmountUsd > 0 && candidate.amountUsd < filter.minAmountUsd) {
+    return `OKX filter: amountUsd $${Math.round(candidate.amountUsd).toLocaleString("en-US")} < $${Math.round(filter.minAmountUsd).toLocaleString("en-US")}`;
+  }
+  const mcap = candidate.marketCapUsd;
+  if (runtime.alertFilter.mcapMin > 0 && mcap > 0 && mcap < runtime.alertFilter.mcapMin) {
+    return `mcap ${Math.round(mcap).toLocaleString("en-US")} < ${Math.round(runtime.alertFilter.mcapMin).toLocaleString("en-US")}`;
+  }
+  if (runtime.alertFilter.mcapMax > 0 && mcap > runtime.alertFilter.mcapMax) {
+    return `mcap ${Math.round(mcap).toLocaleString("en-US")} > ${Math.round(runtime.alertFilter.mcapMax).toLocaleString("en-US")}`;
+  }
+  return null;
 }
 
 function remember(key: string): void {
@@ -362,6 +397,11 @@ async function handleCandidate(candidate: OkxSignalCandidate): Promise<void> {
     reject(candidate, "blacklisted");
     return;
   }
+  const filterReason = candidateFilterRejection(candidate);
+  if (filterReason) {
+    reject(candidate, filterReason);
+    return;
+  }
   const cooldown = checkSignalMintCooldown(candidate.mint, getRuntimeSettings().signals.okx.mintCooldownMins);
   if (!cooldown.ok) {
     reject(candidate, cooldown.reason);
@@ -477,9 +517,14 @@ export async function stopOkxSignalSource(): Promise<void> {
 
 export function getOkxSignalStatus(): OkxSignalStatus {
   const mode = currentMode();
+  const filter = getRuntimeSettings().signals.okx.entryFilter;
   return {
     enabled: isModeEnabled(mode),
     mode,
+    liveFilter: {
+      minHolders: filter.minHolders,
+      walletTypes: [...filter.walletTypes],
+    },
     running,
     seeded,
     sessionId,
@@ -489,6 +534,7 @@ export function getOkxSignalStatus(): OkxSignalStatus {
     candidatesSeen,
     candidatesFiltered,
     candidatesAccepted,
+    lastRejectionReason: recentRejections[recentRejections.length - 1]?.reason,
     recentRejections: [...recentRejections],
     lastCandidate,
   };

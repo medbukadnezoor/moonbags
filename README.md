@@ -2,9 +2,9 @@
 
 > Solana meme-token auto-trading bot with LLM-powered exit decisions.
 
-MoonBags is the **execution and management layer** on top of [SCG Alpha](https://x.com/scg_alpha)'s discovery system. SCG Alpha runs the alpha-filtering brain — they curate meme-coin signals from the firehose using the GMGN API and surface the ones worth acting on. MoonBags consumes that filtered alert stream, buys via Jupiter Ultra, then manages exits with either a configurable trail/stop or — optionally — a MiniMax M2.7 LLM that reads live on-chain data (smart money flow, dev holdings, holder PnL, kline trends) every 30 seconds to decide when to sell.
+MoonBags is the **execution and management layer** for Solana meme-token signals. By default it consumes [SCG Alpha](https://x.com/scg_alpha)'s curated alert stream, buys via Jupiter Ultra, then manages exits with either a configurable trail/stop or — optionally — a MiniMax M2.7 LLM that reads live on-chain data (smart money flow, dev holdings, holder PnL, kline trends) every 30 seconds to decide when to sell.
 
-In other words: **SCG Alpha picks the trades. MoonBags fires them, sizes them, watches them, and exits them.**
+Telegram `/sources` can also enable optional OKX discovery or GMGN Watch/Live scanner modes. Whatever source creates the entry, MoonBags still sizes it, executes through Jupiter, watches it, and exits it with the same universal exit settings.
 
 You operate the bot through a Telegram bot (`/start`, `/positions`, `/settings`, `/sellall`, etc.) or a local web dashboard.
 
@@ -14,7 +14,7 @@ You operate the bot through a Telegram bot (`/start`, `/positions`, `/settings`,
 
 **Not financial advice.** This software is released for educational and research purposes. Using it to trade real money is your decision and your risk alone. Meme coins are extremely volatile — **you will have losing trades, and you can lose your entire wallet balance**. Nothing in this repo, the dashboard, the Telegram bot, or the LLM advisor's output constitutes investment, legal, tax, or any other kind of professional advice. Do your own research.
 
-**Critical upstream dependency — SCG Alpha (+ GMGN).** MoonBags does not discover trades on its own. The **entire signal layer is SCG Alpha's** ([@scg_alpha on X](https://x.com/scg_alpha)) — they run an alpha-filtering system on top of the [GMGN API](https://docs.gmgn.cc/) and feed the curated alerts into the public endpoint this bot polls. **I do not own, operate, or control SCG Alpha or GMGN** — all credit for signal quality goes to them. If either changes their API shape, rate-limits you, changes pricing, or shuts down, the bot's intake stops working until the code (or the upstream provider) is updated. You're also subject to whatever terms of service SCG Alpha and GMGN impose — please review them. If you want a different upstream, replace `src/scgPoller.ts` with your own integration; the rest of the bot is signal-source agnostic.
+**Critical upstream dependencies — SCG Alpha, OKX, and GMGN.** The default signal layer is SCG Alpha's ([@scg_alpha on X](https://x.com/scg_alpha)); optional source modes use OKX OnchainOS and GMGN OpenAPI directly. **I do not own, operate, or control SCG Alpha, OKX, GMGN, Jupiter, Helius, MiniMax, or Telegram**. If any provider changes API shape, rate-limits you, changes pricing, or shuts down, the affected intake or execution path can stop working until the code or provider is updated. You're also subject to each provider's terms of service.
 
 Other third-party services the bot depends on (any of which can break the bot if they change): **Jupiter Ultra** (swap execution + fees), **Helius RPC** (Solana reads), **OKX onchainos CLI** (on-chain data enrichment), **MiniMax** (LLM advisor, optional), **Telegram Bot API** (control + notifications).
 
@@ -54,13 +54,13 @@ Use at your own risk.
 
 The hardest part of meme-coin trading isn't execution — it's *discovery*. Out of the thousands of tokens minted on Solana every day, which ~10 are worth your SOL?
 
-**That problem is fully solved upstream by [SCG Alpha](https://x.com/scg_alpha).** They run an alpha-filtering system that:
+By default, that problem is solved upstream by [SCG Alpha](https://x.com/scg_alpha). They run an alpha-filtering system that:
 
 - Pulls a constant firehose of new mints, smart-money flow, holder data, and on-chain signals via the **[GMGN API](https://docs.gmgn.cc/)**
 - Applies their own scoring + filtering logic (the secret sauce — that's their product, not mine)
 - Surfaces only the alerts that pass their criteria via a public-facing alerts API
 
-**MoonBags is downstream of that.** This bot does NOT decide which tokens are worth trading. It receives the already-curated alert stream from SCG Alpha and acts on it. Without SCG Alpha there is no MoonBags — the entire upstream "what should I buy?" question is theirs to answer.
+**MoonBags is downstream of that in SCG-only mode.** Optional `/sources` modes can also observe or buy from OKX discovery and GMGN scanner candidates, but those modes are off by default and still go through the same local pause, blacklist, cooldown, position, and Jupiter execution safety.
 
 If you want to see the signal quality firsthand, follow [@scg_alpha](https://x.com/scg_alpha). If you want to swap in your own discovery source, replace `src/scgPoller.ts` with your own integration — every other layer in this bot is signal-source agnostic.
 
@@ -69,7 +69,7 @@ If you want to see the signal quality firsthand, follow [@scg_alpha](https://x.c
 ## What it does
 
 1. **Receives** filtered alerts from SCG Alpha's API every 3 seconds — these are pre-vetted by their alpha-filtering system on top of GMGN.
-   - Optional: `/sources` can add OKX smart-money/KOL/whale WSS signals as a second entry source.
+   - Optional: `/sources` can add OKX smart-money/KOL/whale discovery or GMGN scanner candidates as watch-only or live entry sources.
 2. **Buys** new alerts that pass your local filters via Jupiter Ultra (Solana DEX aggregator), spending a fixed SOL amount per trade.
 3. **Tracks** every open position every 3 seconds — pulls live prices, updates the running peak, and checks for arm/trail/stop conditions.
 4. **Arms** a trailing stop once a position hits a profit threshold (default +50%).
@@ -218,7 +218,7 @@ The wizard walks through every credential, validates the services it can check l
 | Step | What it does |
 |------|--------------|
 | 1 | Checks that the `onchainos` CLI is on `$PATH` |
-| 2 | OKX OnchainOS credentials — links to the dev portal and stores API key, secret key, and passphrase |
+| 2 | OKX OnchainOS credentials, plus optional GMGN OpenAPI key for GMGN Watch/Live source modes |
 | 3 | Jupiter API key — with link + live validation |
 | 4 | Helius RPC key — with link + live validation |
 | 5 | Solana wallet — offers to **generate a fresh keypair** (saves to `moonbags-keypair.json`) or accept a pasted base58 secret |
@@ -344,6 +344,16 @@ OKX_PASSPHRASE=your-okx-passphrase
 
 The `onchainos` CLI expects `OKX_PASSPHRASE`. The bot also accepts the older local alias `OKX_API_PASSPHRASE` and passes it through as `OKX_PASSPHRASE` when spawning the CLI. It's IPv4-only.
 
+### GMGN OpenAPI (optional source)
+
+GMGN can be used as an additional signal source from Telegram `/sources`. Create an API key at [gmgn.ai/ai](https://gmgn.ai/ai), then add it to `.env`:
+
+```env
+GMGN_API_KEY=your-gmgn-api-key
+```
+
+GMGN source modes do not use GMGN for execution. MoonBags uses GMGN market/signal data for discovery and still routes buys/sells through Jupiter.
+
 ### 5. Telegram bot
 
 This is how you'll interact with MoonBags.
@@ -394,6 +404,7 @@ HELIUS_API_KEY=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 OKX_API_KEY=your-okx-api-key
 OKX_SECRET_KEY=your-okx-secret-key
 OKX_PASSPHRASE=your-okx-passphrase
+GMGN_API_KEY=your-gmgn-api-key
 PRIV_B58=base58-encoded-solana-keypair-secret
 
 # === RPC ===
@@ -555,17 +566,18 @@ Every command is gated to the `TELEGRAM_CHAT_ID` in `.env` — random users who 
 | `/mcapfilter [min] [max\|off]` | Set or clear the mcap entry filter manually. `/mcapfilter 50000 200000` = $50k–$200k range. `/mcapfilter 50000` = $50k floor, no ceiling. `/mcapfilter off` = clear. Persists in `state/settings.json`. |
 | `/history [N]` | Last N closed trades (default 10, max 50) — name, PnL, exit reason, hold duration. |
 | `/llm` | One-tap toggle for the LLM exit advisor. Warns if `MINIMAX_API_KEY` is empty. |
-| `/sources` | Choose entry source mode: SCG only, OKX Watch, Hybrid Live, or OKX only. |
+| `/sources` | Choose entry source mode: SCG only, OKX Watch/Live/only, or GMGN Watch/Live/only. |
 | `/wss` | OKX WSS status and enable/disable buttons for open-position market-data acceleration. |
-| `/pause` | Stop taking new SCG alerts. Open positions keep running. **Persists across restart.** |
+| `/pause` | Stop taking new SCG/OKX/GMGN entry alerts. Open positions keep running. **Persists across restart.** |
 | `/resume` | Resume taking new alerts. |
 | `/sellall` | Emergency liquidation. Lists every open position, requires typing **`CONFIRM`** (exact, case-sensitive) within 60s. Any other reply cancels. |
-| `/skip <mint>` | Blacklist a token (ignore future SCG alerts for it). `/skip` alone lists current. `/skip clear` resets. **Persists across restart.** |
+| `/skip <mint>` | Blacklist a token (ignore future SCG/OKX/GMGN alerts for it). `/skip` alone lists current. `/skip clear` resets. **Persists across restart.** |
 | `/mint <mint>` | On-demand on-chain snapshot for any token: price + 5m/1h/4h/24h % changes, smart money / bundler / dev flow, top-10 holder PnL, dev hold %, LP burn, GMGN link. |
 | `/wallet` | Full wallet address + SOL balance + Solscan link. |
-| `/backtest` | Run the SCG alert backtester. Uses each alert's `alert_time` as entry, requires post-signal OHLCV runway, compares Trail, Fixed TP, and TP Ladder, then lets you tap a row to **adopt** the exit strategy live. |
+| `/backtest [source] [hybrid]` | Run the exit-strategy backtester. Source: `gmgn` (default) pulls fresh calls from GMGN signals/trenches/trending; `scg` is retained but disabled. Add `hybrid` to switch the grid to trail + scale-out + moonbag. Examples: `/backtest`, `/backtest hybrid`, `/backtest gmgn hybrid`. Tap a row to adopt the exit strategy live. |
+| `/backtest_hybrid` | Alias for `/backtest hybrid` — same source default, hybrid exit grid. |
 | `/doctor` | Run a health check from Telegram. Use this when the bot starts, after changing `.env`, or when something feels off. Mirrors `npm run doctor`. |
-| `/ping` | Live connectivity check for SCG polling, Telegram delivery, and optional OKX WSS runtime state. |
+| `/ping` | Live connectivity check for SCG polling, Telegram delivery, source-mode status, and optional OKX WSS runtime state. |
 | `/setup_status` | Show a plain-English setup checklist: credentials, wallet, Telegram, OKX OnchainOS, and remaining fixes. |
 | `/update` | Check `origin/main`, show incoming commits, then pull + restart through `pm2` after confirmation. Requires `git` and a `pm2` process named `moonbags`. |
 
@@ -590,8 +602,15 @@ Sent to your Telegram chat as events happen. Dedupe is built in so you don't get
 - **OKX Watch** — SCG still buys; OKX discovery signals are tracked and shown but never bought.
 - **Hybrid Live** — SCG alerts and live OKX discovery signals can both buy.
 - **OKX only** — SCG keeps polling for health/status, but only OKX discovery signals can buy.
+- **GMGN Watch** — SCG still buys; GMGN scanner candidates are filtered, tracked, and shown but never bought.
+- **GMGN Live** — SCG alerts and GMGN scanner candidates can both buy after the baseline + tracking trigger passes.
+- **GMGN only** — SCG keeps polling for health/status, but only GMGN scanner candidates can buy.
 
-OKX discovery uses `dex-market-new-signal-openapi`, the OnchainOS smart-money/KOL/whale signal feed. Historical `onchainos signal list` rows are used only to seed dedupe on startup, so old rows are not bought. Live OKX signals are treated as entry triggers in Hybrid/OKX-only modes; pause, blacklist, duplicate/mint cooldown, max-position, and Jupiter execution safety still apply.
+OKX discovery uses `dex-market-new-signal-openapi`, the OnchainOS smart-money/KOL/whale signal feed. Historical `onchainos signal list` rows are used only to seed dedupe on startup, so old rows are not bought. Live OKX signals are treated as entry triggers in Hybrid/OKX-only modes only when they pass the OKX live-buy filter in `state/settings.json`: Smart Money/KOL wallet type and at least 500 holders by default. Pause, blacklist, duplicate/mint cooldown, max-position, and Jupiter execution safety still apply.
+
+The OKX live-buy filter is intentionally separate from exit settings. OKX entries still use your current active exit strategy unless you change it in `/settings`.
+
+GMGN uses a scanner/watchlist flow. Each scan pulls GMGN trending, Trenches, and signal data, applies a fast baseline filter, then tracks surviving mints across multiple scans. Defaults live in `state/settings.json`: holders at least 200, liquidity at least $10k, top-10 holders at most 50%, rug/bundler/bot rates capped, creator hold capped, wash trading rejected, then at least two scans with holder growth, stable liquidity, buy pressure, and smart/KOL confirmation. GMGN Watch is the safest first rollout because it records forward snapshots before allowing live buys.
 
 **Settings you can edit live via `/settings`:**
 
@@ -957,6 +976,9 @@ src/
 ├── jupTokensClient.ts   ← Jupiter Tokens API enrichment (verification, organic score, audit)
 ├── priceFeed.ts         ← OKX prices (primary) + Jupiter sell quote (fallback)
 ├── okxClient.ts         ← onchainos CLI wrapper for the LLM data layer + dashboard kline
+├── okxSignalSource.ts   ← optional OKX discovery source for `/sources`
+├── gmgnClient.ts        ← GMGN OpenAPI client for optional GMGN source modes
+├── gmgnSignalSource.ts  ← GMGN scanner/watchlist source for `/sources`
 ├── llmExitAdvisor.ts    ← MiniMax M2.7 client + tool calling (`enable_thinking`, `extra_body.reasoning_split`)
 ├── notifier.ts          ← Telegram notifications (with HTML escaping)
 ├── telegramBot.ts       ← Telegram command handler (long polling, force_reply for edits)

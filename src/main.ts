@@ -1,3 +1,6 @@
+// [SCG-DISABLED 2026-04-22] SCG polling retired — keeping OKX + GMGN only.
+// Preserving import so scgPoller state (dedupe set, blacklist, etc.) still loads
+// for historical telegram views; `startScgPoller` stays imported but unused below.
 import { startScgPoller, loadPollerState } from "./scgPoller.js";
 import { openPosition, tickPositions, tickLlmAdvisor, getPositions, loadPersistedPositions } from "./positionManager.js";
 import { startServer } from "./server.js";
@@ -6,6 +9,7 @@ import { notifyBoot } from "./notifier.js";
 import { unwrapResidualWsol } from "./jupClient.js";
 import { startOkxWsService, stopOkxWsService, watchOkxWsMint } from "./okxWsService.js";
 import { startOkxSignalSource, stopOkxSignalSource } from "./okxSignalSource.js";
+import { startGmgnSignalSource, stopGmgnSignalSource } from "./gmgnSignalSource.js";
 import { CONFIG } from "./config.js";
 import logger from "./logger.js";
 
@@ -59,6 +63,15 @@ async function main(): Promise<void> {
       }
     },
   });
+  startGmgnSignalSource({
+    onAcceptedCandidate: async (alert) => {
+      try {
+        await openPosition(alert);
+      } catch (e) {
+        logger.error({ err: String(e), mint: alert.mint }, "openPosition crashed for GMGN signal");
+      }
+    },
+  });
 
   const stopServer = startServer();
   logger.info({ url: `http://localhost:${CONFIG.DASHBOARD_PORT}/` }, "dashboard available");
@@ -66,13 +79,16 @@ async function main(): Promise<void> {
   const stopTelegram = startTelegramBot();
   void notifyBoot();
 
-  const stopPoller = startScgPoller(async (alert) => {
-    try {
-      await openPosition(alert);
-    } catch (e) {
-      logger.error({ err: String(e), mint: alert.mint }, "openPosition crashed");
-    }
-  });
+  // [SCG-DISABLED 2026-04-22] SCG poller no longer starts. OKX + GMGN sources above
+  // are the only live signal producers. Re-enable by uncommenting this block.
+  // const stopPoller = startScgPoller(async (alert) => {
+  //   try {
+  //     await openPosition(alert);
+  //   } catch (e) {
+  //     logger.error({ err: String(e), mint: alert.mint }, "openPosition crashed");
+  //   }
+  // });
+  const stopPoller = (): void => { /* [SCG-DISABLED 2026-04-22] no-op shim */ };
 
   const tickInterval = setInterval(() => {
     requestPositionTick("interval");
@@ -104,7 +120,7 @@ async function main(): Promise<void> {
     stopTelegram();
     clearInterval(tickInterval);
     clearInterval(llmInterval);
-    void Promise.allSettled([stopOkxWsService(), stopOkxSignalSource()])
+    void Promise.allSettled([stopOkxWsService(), stopOkxSignalSource(), stopGmgnSignalSource()])
       .then((results) => {
         for (const result of results) {
           if (result.status === "rejected") logger.warn({ err: String(result.reason) }, "[shutdown] source stop failed");

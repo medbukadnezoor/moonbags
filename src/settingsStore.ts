@@ -7,7 +7,7 @@ const STATE_DIR = path.resolve("state");
 const SETTINGS_FILE = path.join(STATE_DIR, "settings.json");
 
 export type ExitStrategyMode = "trail" | "fixed_tp" | "tp_ladder" | "llm_managed";
-export type SourceMode = "scg_only" | "okx_watch" | "hybrid" | "okx_only";
+export type SourceMode = "scg_only" | "okx_watch" | "hybrid" | "okx_only" | "gmgn_watch" | "gmgn_live" | "gmgn_only";
 
 export type TpTarget = {
   pnlPct: number;  // decimal, e.g. 0.5 = +50%
@@ -58,6 +58,37 @@ export type RuntimeSettings = {
       enabled: boolean;
       seedLimit: number;
       mintCooldownMins: number;
+      entryFilter: {
+        minHolders: number;
+        walletTypes: number[];
+        minAmountUsd: number;
+      };
+    };
+    gmgn: {
+      enabled: boolean;
+      pollMs: number;
+      mintCooldownMins: number;
+      watchlistTtlMins: number;
+      maxWatchMints: number;
+      baseline: {
+        minHolders: number;
+        minLiquidityUsd: number;
+        minMcapUsd: number;
+        maxMcapUsd: number;
+        maxTop10HolderRate: number;
+        maxRugRatio: number;
+        maxBundlerRate: number;
+        maxBotRate: number;
+        maxCreatorBalanceRate: number;
+        requireNotWashTrading: boolean;
+      };
+      trigger: {
+        minScans: number;
+        minHolderGrowthPct: number;
+        maxLiquidityDropPct: number;
+        minBuySellRatio: number;
+        minSmartOrKolCount: number;
+      };
     };
   };
   marketData: {
@@ -82,6 +113,9 @@ export const SOURCE_MODE_LABELS: Record<SourceMode, string> = {
   okx_watch: "OKX Watch",
   hybrid: "Hybrid Live",
   okx_only: "OKX only",
+  gmgn_watch: "GMGN Watch",
+  gmgn_live: "GMGN Live",
+  gmgn_only: "GMGN only",
 };
 
 const DEFAULT_TP_TARGETS: TpTarget[] = [
@@ -132,11 +166,51 @@ function defaultSettings(): RuntimeSettings {
       mcapMax: CONFIG.MAX_ALERT_MCAP,
     },
     signals: {
-      sourceMode: "scg_only",
+      // [SCG-DISABLED 2026-04-22] Default flipped from "scg_only" to "gmgn_watch"
+      // since SCG polling is off. Pick "okx_watch" or "gmgn_watch" — both are conservative
+      // (watch-only, no auto-buy until you flip enabled). Change back to "scg_only"
+      // when re-enabling SCG.
+      sourceMode: "gmgn_watch",
       okx: {
         enabled: false,
         seedLimit: 100,
         mintCooldownMins: 60,
+        entryFilter: {
+          // 2026-04-22 — lowered from 500 → 100. Filter analysis on 156 OKX
+          // signals showed minHolders=500 cut winrate from 35% → 28%; data
+          // says 100-250 is the right floor for this source.
+          minHolders: 100,
+          walletTypes: [1, 2],
+          // 2026-04-22 — new field. Combined with mcapMin=25k this lifts
+          // winrate to 45% with medFinal -5% on the OKX signal stream.
+          minAmountUsd: 500,
+        },
+      },
+      gmgn: {
+        enabled: false,
+        pollMs: 60_000,
+        mintCooldownMins: 60,
+        watchlistTtlMins: 180,
+        maxWatchMints: 120,
+        baseline: {
+          minHolders: 200,
+          minLiquidityUsd: 10_000,
+          minMcapUsd: 0,
+          maxMcapUsd: 0,
+          maxTop10HolderRate: 0.5,
+          maxRugRatio: 0.3,
+          maxBundlerRate: 0.5,
+          maxBotRate: 0.5,
+          maxCreatorBalanceRate: 0.2,
+          requireNotWashTrading: true,
+        },
+        trigger: {
+          minScans: 2,
+          minHolderGrowthPct: 5,
+          maxLiquidityDropPct: 30,
+          minBuySellRatio: 1.15,
+          minSmartOrKolCount: 1,
+        },
       },
     },
     marketData: {
@@ -182,6 +256,14 @@ function normalizeStringList(value: unknown, fallback: string[]): string[] {
   return items.length > 0 ? Array.from(new Set(items)) : fallback;
 }
 
+function normalizeNumberList(value: unknown, fallback: number[], min = -Infinity, max = Infinity): number[] {
+  if (!Array.isArray(value)) return fallback;
+  const items = value
+    .map((item) => Math.round(num(item, NaN, min, max)))
+    .filter(Number.isFinite);
+  return items.length > 0 ? Array.from(new Set(items)) : fallback;
+}
+
 function normalizeSettings(raw: unknown): RuntimeSettings {
   const defaults = defaultSettings();
   const root = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
@@ -197,6 +279,16 @@ function normalizeSettings(raw: unknown): RuntimeSettings {
   const alertFilter = (root.alertFilter && typeof root.alertFilter === "object" ? root.alertFilter : {}) as Record<string, unknown>;
   const signals = (root.signals && typeof root.signals === "object" ? root.signals : {}) as Record<string, unknown>;
   const okxSignals = (signals.okx && typeof signals.okx === "object" ? signals.okx : {}) as Record<string, unknown>;
+  const okxEntryFilter = (
+    okxSignals.entryFilter && typeof okxSignals.entryFilter === "object" ? okxSignals.entryFilter : {}
+  ) as Record<string, unknown>;
+  const gmgnSignals = (signals.gmgn && typeof signals.gmgn === "object" ? signals.gmgn : {}) as Record<string, unknown>;
+  const gmgnBaseline = (
+    gmgnSignals.baseline && typeof gmgnSignals.baseline === "object" ? gmgnSignals.baseline : {}
+  ) as Record<string, unknown>;
+  const gmgnTrigger = (
+    gmgnSignals.trigger && typeof gmgnSignals.trigger === "object" ? gmgnSignals.trigger : {}
+  ) as Record<string, unknown>;
   const marketData = (root.marketData && typeof root.marketData === "object" ? root.marketData : {}) as Record<string, unknown>;
   const wss = (marketData.wss && typeof marketData.wss === "object" ? marketData.wss : {}) as Record<string, unknown>;
 
@@ -211,7 +303,13 @@ function normalizeSettings(raw: unknown): RuntimeSettings {
     : defaults.milestones.pcts;
   const rawSourceMode = signals.sourceMode;
   const sourceMode: SourceMode =
-    rawSourceMode === "okx_watch" || rawSourceMode === "hybrid" || rawSourceMode === "okx_only" || rawSourceMode === "scg_only"
+    rawSourceMode === "okx_watch" ||
+    rawSourceMode === "hybrid" ||
+    rawSourceMode === "okx_only" ||
+    rawSourceMode === "gmgn_watch" ||
+    rawSourceMode === "gmgn_live" ||
+    rawSourceMode === "gmgn_only" ||
+    rawSourceMode === "scg_only"
       ? rawSourceMode
       : defaults.signals.sourceMode;
 
@@ -259,6 +357,37 @@ function normalizeSettings(raw: unknown): RuntimeSettings {
         enabled: bool(okxSignals.enabled, sourceMode === "okx_watch" || sourceMode === "hybrid" || sourceMode === "okx_only"),
         seedLimit: Math.round(num(okxSignals.seedLimit, defaults.signals.okx.seedLimit, 0, 5000)),
         mintCooldownMins: num(okxSignals.mintCooldownMins, defaults.signals.okx.mintCooldownMins, 0, 1440),
+        entryFilter: {
+          minHolders: Math.round(num(okxEntryFilter.minHolders, defaults.signals.okx.entryFilter.minHolders, 0, 1_000_000_000)),
+          walletTypes: normalizeNumberList(okxEntryFilter.walletTypes, defaults.signals.okx.entryFilter.walletTypes, 1, 99),
+          minAmountUsd: num(okxEntryFilter.minAmountUsd, defaults.signals.okx.entryFilter.minAmountUsd, 0, 1_000_000_000),
+        },
+      },
+      gmgn: {
+        enabled: bool(gmgnSignals.enabled, sourceMode === "gmgn_watch" || sourceMode === "gmgn_live" || sourceMode === "gmgn_only"),
+        pollMs: Math.round(num(gmgnSignals.pollMs, defaults.signals.gmgn.pollMs, 15_000, 600_000)),
+        mintCooldownMins: num(gmgnSignals.mintCooldownMins, defaults.signals.gmgn.mintCooldownMins, 0, 1440),
+        watchlistTtlMins: num(gmgnSignals.watchlistTtlMins, defaults.signals.gmgn.watchlistTtlMins, 5, 1440),
+        maxWatchMints: Math.round(num(gmgnSignals.maxWatchMints, defaults.signals.gmgn.maxWatchMints, 10, 1000)),
+        baseline: {
+          minHolders: Math.round(num(gmgnBaseline.minHolders, defaults.signals.gmgn.baseline.minHolders, 0, 1_000_000_000)),
+          minLiquidityUsd: num(gmgnBaseline.minLiquidityUsd, defaults.signals.gmgn.baseline.minLiquidityUsd, 0),
+          minMcapUsd: num(gmgnBaseline.minMcapUsd, defaults.signals.gmgn.baseline.minMcapUsd, 0),
+          maxMcapUsd: num(gmgnBaseline.maxMcapUsd, defaults.signals.gmgn.baseline.maxMcapUsd, 0),
+          maxTop10HolderRate: num(gmgnBaseline.maxTop10HolderRate, defaults.signals.gmgn.baseline.maxTop10HolderRate, 0, 1),
+          maxRugRatio: num(gmgnBaseline.maxRugRatio, defaults.signals.gmgn.baseline.maxRugRatio, 0, 1),
+          maxBundlerRate: num(gmgnBaseline.maxBundlerRate, defaults.signals.gmgn.baseline.maxBundlerRate, 0, 1),
+          maxBotRate: num(gmgnBaseline.maxBotRate, defaults.signals.gmgn.baseline.maxBotRate, 0, 1),
+          maxCreatorBalanceRate: num(gmgnBaseline.maxCreatorBalanceRate, defaults.signals.gmgn.baseline.maxCreatorBalanceRate, 0, 1),
+          requireNotWashTrading: bool(gmgnBaseline.requireNotWashTrading, defaults.signals.gmgn.baseline.requireNotWashTrading),
+        },
+        trigger: {
+          minScans: Math.round(num(gmgnTrigger.minScans, defaults.signals.gmgn.trigger.minScans, 1, 20)),
+          minHolderGrowthPct: num(gmgnTrigger.minHolderGrowthPct, defaults.signals.gmgn.trigger.minHolderGrowthPct, 0, 1000),
+          maxLiquidityDropPct: num(gmgnTrigger.maxLiquidityDropPct, defaults.signals.gmgn.trigger.maxLiquidityDropPct, 0, 100),
+          minBuySellRatio: num(gmgnTrigger.minBuySellRatio, defaults.signals.gmgn.trigger.minBuySellRatio, 0, 1000),
+          minSmartOrKolCount: Math.round(num(gmgnTrigger.minSmartOrKolCount, defaults.signals.gmgn.trigger.minSmartOrKolCount, 0, 1000)),
+        },
       },
     },
     marketData: {

@@ -150,6 +150,15 @@ function checkEnvVars(env: EnvMap): DoctorCheck[] {
     fix: okxSet ? undefined : "Create keys at https://web3.okx.com/onchain-os/dev-portal, then run npm run setup.",
   });
 
+  const gmgnSet = hasValue(env, "GMGN_API_KEY");
+  checks.push({
+    id: "env:gmgn",
+    label: "GMGN OpenAPI key",
+    status: gmgnSet ? "ok" : "warn",
+    detail: gmgnSet ? "set" : "missing GMGN_API_KEY (GMGN source modes disabled)",
+    fix: gmgnSet ? undefined : "Create a GMGN API key at https://gmgn.ai/ai and add GMGN_API_KEY to .env.",
+  });
+
   const telegramSet = hasValue(env, "TELEGRAM_BOT_TOKEN") && hasValue(env, "TELEGRAM_CHAT_ID");
   checks.push({
     id: "env:telegram",

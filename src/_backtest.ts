@@ -13,8 +13,19 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
+// [SCG-DISABLED 2026-04-22] SCG_URL import kept ONLY because `fetchScgTokens`
+// below references it and the user asked to leave that function body intact.
+// The default backtest source is now "gmgn"; nothing calls fetchScgTokens from
+// the default branching. Delete this import when fully retiring SCG.
 import { SCG_URL } from "./scgPoller.js";
 import type { ScgAlertsResponse } from "./types.js";
+import {
+  getMarketSignal,
+  getMarketTrenches,
+  getMarketTrending,
+  isGmgnConfigured,
+  type GmgnRow,
+} from "./gmgnClient.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -30,7 +41,8 @@ const TOP_N       = parseInt(arg("--top", "15"));
 const TOKEN_LIMIT = parseInt(arg("--tokens", "0"));
 const MIN_CANDLES = parseInt(arg("--min-candles", "60"));   // ~5 hours of 5m data
 const STRATEGY    = arg("--strategy", "all");               // "all" | "simple" | "hybrid" | "protective"
-const SOURCE      = arg("--source", "scg");                 // "scg" | "hot"
+// [SCG-DISABLED 2026-04-22] CLI default flipped from "scg" to "gmgn".
+const SOURCE      = arg("--source", "gmgn");                // "scg" | "hot" | "gmgn"
 const FEE_BPS     = parseInt(arg("--fee-bps", "50"));         // Ultra platform fee per swap (50 bps = 0.5%)
 const SLIPPAGE_BPS = parseInt(arg("--slippage-bps", "150"));  // estimated slippage per swap (150 bps = 1.5%)
 
@@ -84,7 +96,7 @@ interface TokenSample {
   alertTimeSec?: number;
   alertMcap?: number;
   impliedSupply?: number;
-  source: "scg" | "hot";
+  source: "scg" | "hot" | "gmgn";
 }
 interface CandleSample {
   symbol: string;
@@ -188,6 +200,72 @@ async function fetchHotTokens(): Promise<TokenSample[]> {
   }
 }
 
+function pickGmgnString(row: GmgnRow, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const v = row[key];
+    if (typeof v === "string" && v.trim().length > 0) return v.trim();
+  }
+  return undefined;
+}
+
+function pickGmgnNumber(row: GmgnRow, keys: string[]): number | undefined {
+  for (const key of keys) {
+    const v = row[key];
+    const n = typeof v === "number" ? v : Number(v);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return undefined;
+}
+
+async function fetchGmgnTokens(): Promise<TokenSample[]> {
+  if (!isGmgnConfigured()) {
+    throw new Error("GMGN_API_KEY is not set — cannot run GMGN backtest. Add it to .env and restart.");
+  }
+  const chain = "sol" as const;
+  const settled = await Promise.allSettled([
+    getMarketSignal(chain, { groups: [{ signal_type: [12] }], limit: 50 }),
+    getMarketTrenches(chain, { limit: 50 }),
+    getMarketTrending(chain, "5m", { limit: 50 }),
+  ]);
+  const signalRows = settled[0].status === "fulfilled" ? settled[0].value : [];
+  const trenchesRows = settled[1].status === "fulfilled" ? settled[1].value : [];
+  const trendingRows = settled[2].status === "fulfilled" ? settled[2].value : [];
+
+  const seen = new Set<string>();
+  const tokens: TokenSample[] = [];
+
+  const harvest = (rows: GmgnRow[], withTimestamp: boolean) => {
+    for (const row of rows) {
+      const address = pickGmgnString(row, ["address", "token_address", "mint", "contract_address"]);
+      if (!address || seen.has(address)) continue;
+      const symbol = pickGmgnString(row, ["symbol", "name"]) ?? address.slice(0, 6);
+      const alertTimeSec = withTimestamp
+        ? pickGmgnNumber(row, ["signal_time", "created_at", "timestamp", "open_timestamp", "call_time"])
+        : undefined;
+      const alertMcap = pickGmgnNumber(row, ["market_cap", "marketCap", "marketCapUsd", "mcap"]);
+      seen.add(address);
+      tokens.push({
+        address,
+        symbol,
+        alertTimeSec: alertTimeSec && alertTimeSec > 1_600_000_000 && alertTimeSec < 2_000_000_000_000
+          ? (alertTimeSec > 1e12 ? Math.floor(alertTimeSec / 1000) : Math.floor(alertTimeSec))
+          : undefined,
+        alertMcap,
+        source: "gmgn",
+      });
+    }
+  };
+
+  harvest(signalRows, true);
+  harvest(trenchesRows, false);
+  harvest(trendingRows, false);
+
+  if (tokens.length === 0) {
+    throw new Error("GMGN returned no tokens across signal/trenches/trending endpoints.");
+  }
+  return tokens;
+}
+
 async function fetchScgTokens(): Promise<TokenSample[]> {
   const res = await fetch(SCG_URL);
   if (!res.ok) {
@@ -250,13 +328,14 @@ function hasRunway(candles: Candle[], alertTimeSec?: number): boolean {
   return Boolean(lastTs && lastTs - alertTimeSec * 1000 >= SCG_MIN_RUNWAY_MS);
 }
 
-function minCandlesForBar(bar: string, configuredMin: number, source: "scg" | "hot"): number {
-  if (source === "scg") return MIN_CANDLES_BY_BAR[bar] ?? configuredMin;
+function minCandlesForBar(bar: string, configuredMin: number, source: "scg" | "hot" | "gmgn"): number {
+  if (source === "scg" || source === "gmgn") return MIN_CANDLES_BY_BAR[bar] ?? configuredMin;
   return configuredMin;
 }
 
 async function fetchSampleCandles(token: TokenSample, preferredBar: string, configuredMin: number): Promise<CandleSample | null> {
-  if (token.source !== "scg") {
+  const hasAlertTime = Boolean(token.alertTimeSec && Number.isFinite(token.alertTimeSec));
+  if (token.source !== "scg" && !hasAlertTime) {
     const candles = await fetchKlines(token.address, preferredBar);
     return candles.length >= configuredMin
       ? { symbol: token.symbol, candles, bar: preferredBar, entrySource: "first_candle" }
@@ -503,7 +582,7 @@ export interface RunBacktestOptions {
   mbTrailRange?: number[];    // moonbag's own drawdown trail. default [0.50, 0.60, 0.70]
   mbTimeoutRange?: number[];  // moonbag max hold, minutes. default [30, 60, 120]
   onProgress?: (stage: "fetching" | "simulating", pct: number) => void;
-  source?: "scg" | "hot";
+  source?: "scg" | "hot" | "gmgn";
   tokenLimit?: number;
 }
 
@@ -513,7 +592,7 @@ export interface RunBacktestResult {
   allResults: GridResult[];     // full grid, sorted best→worst
   topResults: GridResult[];     // top N slice for convenience
   bar: string;
-  source: "scg" | "hot";
+  source: "scg" | "hot" | "gmgn";
   resolutionCounts: Record<string, number>;
   entrySourceCounts: Record<string, number>;
   durationMs: number;
@@ -529,7 +608,8 @@ export async function runBacktest(opts: RunBacktestOptions = {}): Promise<RunBac
   const bar = opts.bar ?? "5m";
   const minCandles = opts.minCandles ?? 60;
   const topN = opts.topN ?? 10;
-  const source = opts.source ?? "scg";
+  // [SCG-DISABLED 2026-04-22] Default flipped from "scg" to "gmgn".
+  const source = opts.source ?? "gmgn";
   const armRange   = opts.armRange ?? ARM_RANGE;
   const trailRange = opts.trailRange ?? TRAIL_RANGE;
   const stopRange  = opts.stopRange ?? STOP_RANGE;
@@ -538,7 +618,15 @@ export async function runBacktest(opts: RunBacktestOptions = {}): Promise<RunBac
 
   // 1. Fetch hot tokens
   opts.onProgress?.("fetching", 0);
-  const fetchedTokens = source === "scg" ? await fetchScgTokens() : await fetchHotTokens();
+  // [SCG-DISABLED 2026-04-22] SCG branch commented out of the default fetch path.
+  // fetchScgTokens stays defined above so this can be restored verbatim.
+  const fetchedTokens =
+    // source === "scg"
+    //   ? await fetchScgTokens()
+    //   :
+    source === "gmgn"
+      ? await fetchGmgnTokens()
+      : await fetchHotTokens();
   const tokens = opts.tokenLimit && opts.tokenLimit > 0 ? fetchedTokens.slice(0, opts.tokenLimit) : fetchedTokens;
 
   // 2. Fetch klines in parallel batches
@@ -774,7 +862,8 @@ async function main(): Promise<void> {
       topN: TOP_N,
       minCandles: MIN_CANDLES,
       allStrategies: true,
-      source: SOURCE === "hot" ? "hot" : "scg",
+      // [SCG-DISABLED 2026-04-22] Non-hot default is now "gmgn" (was "scg").
+      source: SOURCE === "hot" ? "hot" : SOURCE === "scg" ? "scg" : "gmgn",
       tokenLimit: TOKEN_LIMIT > 0 ? TOKEN_LIMIT : undefined,
     });
     const resolutionText = Object.entries(result.resolutionCounts).map(([bar, count]) => `${count} ${bar}`).join(" · ") || "none";

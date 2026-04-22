@@ -77,12 +77,20 @@ const BACKTEST_LADDER_PRESETS: Record<string, BacktestTpTarget[]> = {
   runner: [{ pnlPct: 0.50, sellPct: 0.25 }, { pnlPct: 1.00, sellPct: 0.25 }, { pnlPct: 2.00, sellPct: 0.25 }],
 };
 
-const SOURCE_MODES: SourceMode[] = ["scg_only", "okx_watch", "hybrid", "okx_only"];
+// [SCG-DISABLED 2026-04-22] "scg_only" removed from active SOURCE_MODES so the
+// telegram UI no longer offers it. Restore the scg_only entry when re-enabling SCG.
+const SOURCE_MODES: SourceMode[] = [/* "scg_only", */ "okx_watch", "hybrid", "okx_only", "gmgn_watch", "gmgn_live", "gmgn_only"];
 const OKX_SIGNAL_SOURCE_MODULE = "./okxSignalSource.js";
+const GMGN_SIGNAL_SOURCE_MODULE = "./gmgnSignalSource.js";
 
 type OkxSignalSourceModule = {
   getOkxSignalStatus?: () => unknown | Promise<unknown>;
   refreshOkxSignalSource?: () => void | Promise<void>;
+};
+
+type GmgnSignalSourceModule = {
+  getGmgnSignalStatus?: () => unknown | Promise<unknown>;
+  refreshGmgnSignalSource?: () => void | Promise<void>;
 };
 
 type OkxSignalStatusResult = {
@@ -90,6 +98,8 @@ type OkxSignalStatusResult = {
   status?: unknown;
   error?: string;
 };
+
+type GmgnSignalStatusResult = OkxSignalStatusResult;
 
 function setConfigValue(key: SettableKey, raw: string): SetConfigResult {
   const result = setConfigValueRaw(key, raw);
@@ -140,6 +150,44 @@ async function refreshSafeOkxSignalSource(): Promise<OkxSignalStatusResult> {
   try {
     await mod.refreshOkxSignalSource();
     return getSafeOkxSignalStatus();
+  } catch (err) {
+    return { available: false, error: (err as Error)?.message ?? String(err) };
+  }
+}
+
+async function loadGmgnSignalSource(): Promise<GmgnSignalSourceModule | null> {
+  try {
+    return (await import(GMGN_SIGNAL_SOURCE_MODULE)) as GmgnSignalSourceModule;
+  } catch (err) {
+    const msg = (err as Error)?.message ?? String(err);
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code !== "ERR_MODULE_NOT_FOUND" && code !== "MODULE_NOT_FOUND") {
+      logger.warn({ err: msg }, "[gmgn-signal] failed to load source module");
+    }
+    return null;
+  }
+}
+
+async function getSafeGmgnSignalStatus(): Promise<GmgnSignalStatusResult> {
+  const mod = await loadGmgnSignalSource();
+  if (!mod?.getGmgnSignalStatus) {
+    return { available: false, error: "src/gmgnSignalSource.ts not loaded yet" };
+  }
+  try {
+    return { available: true, status: await mod.getGmgnSignalStatus() };
+  } catch (err) {
+    return { available: false, error: (err as Error)?.message ?? String(err) };
+  }
+}
+
+async function refreshSafeGmgnSignalSource(): Promise<GmgnSignalStatusResult> {
+  const mod = await loadGmgnSignalSource();
+  if (!mod?.refreshGmgnSignalSource) {
+    return { available: false, error: "src/gmgnSignalSource.ts not loaded yet" };
+  }
+  try {
+    await mod.refreshGmgnSignalSource();
+    return getSafeGmgnSignalStatus();
   } catch (err) {
     return { available: false, error: (err as Error)?.message ?? String(err) };
   }
@@ -248,8 +296,10 @@ function formatPosition(p: Position): string {
   const armed = p.armed ? " ⚡" : "";
   const icon = pnl >= 0 ? "🟢" : "🔴";
   const mint = `${p.mint.slice(0, 4)}…${p.mint.slice(-4)}`;
+  const source = p.signalMeta?.source;
+  const sourceTag = source ? ` · ${escapeHtml(source)}` : "";
   return (
-    `${icon} <b>${escapeHtml(p.name)}</b>${armed}  <code>${escapeHtml(mint)}</code>\n` +
+    `${icon} <b>${escapeHtml(p.name)}</b>${armed}  <code>${escapeHtml(mint)}</code>${sourceTag}\n` +
     `   PnL: ${pnl >= 0 ? "+" : ""}${pnl.toFixed(1)}%  peak: ${entry > 0 ? ((peak / entry - 1) * 100).toFixed(0) : "0"}%  pullback: ${drawdown.toFixed(1)}%`
   );
 }
@@ -702,7 +752,7 @@ async function handleCallback(cq: NonNullable<Update["callback_query"]>): Promis
 }
 
 // ---------------------------------------------------------------------------
-// /pause and /resume — stop / resume taking new SCG alerts.
+// /pause and /resume — stop / resume taking new source alerts.
 // Open positions keep running regardless.
 // ---------------------------------------------------------------------------
 async function handlePause(chatId: number): Promise<void> {
@@ -714,7 +764,7 @@ async function handlePause(chatId: number): Promise<void> {
   logger.info("[telegram] bot paused via /pause");
   await tgPost("sendMessage", {
     chat_id: chatId,
-    text: "⏸ <b>Paused</b> — new SCG alerts will be ignored.\nOpen positions keep running.\nUse /resume to resume.",
+    text: "⏸ <b>Paused</b> — new SCG/OKX/GMGN alerts will be ignored.\nOpen positions keep running.\nUse /resume to resume.",
     parse_mode: "HTML",
   });
 }
@@ -812,6 +862,18 @@ function firstString(root: unknown, paths: string[][]): string | null {
   return null;
 }
 
+function firstBoolean(root: unknown, paths: string[][]): boolean | null {
+  for (const pathParts of paths) {
+    const raw = readPath(root, pathParts);
+    if (typeof raw === "boolean") return raw;
+    if (typeof raw === "string") {
+      if (raw === "true") return true;
+      if (raw === "false") return false;
+    }
+  }
+  return null;
+}
+
 function firstObject(root: unknown, paths: string[][]): Record<string, unknown> | null {
   for (const pathParts of paths) {
     const rec = looseRecord(readPath(root, pathParts));
@@ -820,8 +882,42 @@ function firstObject(root: unknown, paths: string[][]): Record<string, unknown> 
   return null;
 }
 
+function firstNumberList(root: unknown, paths: string[][]): number[] {
+  for (const pathParts of paths) {
+    const raw = readPath(root, pathParts);
+    if (!Array.isArray(raw)) continue;
+    const values = raw
+      .map((value) => Number(value))
+      .filter(Number.isFinite);
+    if (values.length > 0) return values;
+  }
+  return [];
+}
+
 function formatLooseCount(value: number | null): string {
   return value == null ? "—" : value.toLocaleString("en-US");
+}
+
+function formatOkxWalletTypes(types: number[]): string {
+  if (types.length === 0) return "any";
+  return types
+    .map((type) => {
+      if (type === 1) return "Smart";
+      if (type === 2) return "KOL";
+      if (type === 3) return "Whale";
+      return `type ${type}`;
+    })
+    .join("/");
+}
+
+function formatOkxLiveFilter(status: unknown): string {
+  const minHolders = firstNumber(status, [["liveFilter", "minHolders"], ["filter", "minHolders"]]);
+  const walletTypes = firstNumberList(status, [["liveFilter", "walletTypes"], ["filter", "walletTypes"]]);
+  const pieces = [
+    minHolders != null ? `holders >= ${minHolders.toLocaleString("en-US")}` : null,
+    `wallets ${formatOkxWalletTypes(walletTypes)}`,
+  ].filter(Boolean);
+  return pieces.length > 0 ? pieces.join(" · ") : "—";
 }
 
 function formatLooseCandidate(candidate: Record<string, unknown> | null): string {
@@ -856,10 +952,10 @@ function okxDiscoveryStatusLines(result: OkxSignalStatusResult): string[] {
     return [`• status: unavailable — <code>${escapeHtml(result.error ?? "unknown")}</code>`];
   }
   const status = result.status;
-  const enabled = firstString(status, [["enabled"]]);
+  const enabled = firstBoolean(status, [["enabled"]]);
   const state =
     firstString(status, [["state"], ["status"], ["mode"]]) ??
-    (enabled === "false" ? "disabled" : enabled === "true" ? "enabled" : "loaded");
+    (enabled === false ? "disabled" : enabled === true ? "enabled" : "loaded");
   const lastRefreshAt = firstNumber(status, [["lastRefreshAt"], ["lastScanAt"], ["lastTickAt"], ["lastRunAt"]]);
   const lastError = firstString(status, [["lastError"], ["error"]]);
   const counts = okxStatusCounts(status);
@@ -873,6 +969,46 @@ function okxDiscoveryStatusLines(result: OkxSignalStatusResult): string[] {
   ]);
   const lines = [
     `• status: ${escapeHtml(state)}${lastRefreshAt ? ` · last refresh ${formatAgo(Date.now() - lastRefreshAt)}` : ""}`,
+    `• live buy filter: ${escapeHtml(formatOkxLiveFilter(status))}`,
+    `• counts: seen ${formatLooseCount(counts.seen)} · filtered ${formatLooseCount(counts.filtered)} · accepted ${formatLooseCount(counts.accepted)}`,
+    `• latest candidate: ${formatLooseCandidate(latest)}`,
+    `• last rejection: ${rejection ? `<code>${escapeHtml(rejection)}</code>` : "—"}`,
+  ];
+  if (lastError) {
+    lines.push(`• last error: <code>${escapeHtml(lastError)}</code>`);
+  }
+  return lines;
+}
+
+function gmgnDiscoveryStatusLines(result: GmgnSignalStatusResult): string[] {
+  if (!result.available) {
+    return [`• status: unavailable — <code>${escapeHtml(result.error ?? "unknown")}</code>`];
+  }
+  const status = result.status;
+  const enabled = firstBoolean(status, [["enabled"]]);
+  const running = firstBoolean(status, [["running"]]);
+  const mode = firstString(status, [["sourceMode"], ["mode"]]);
+  const lastScanAt = firstNumber(status, [["lastScanAt"], ["lastPollAt"], ["lastRefreshAt"], ["lastRunAt"]]);
+  const lastError = firstString(status, [["lastError"], ["error"]]);
+  const counts = okxStatusCounts(status);
+  const watched = firstNumber(status, [["watchedMints"], ["watchlistSize"], ["watchlist", "size"]]);
+  const latest = firstObject(status, [["lastCandidate"], ["latestCandidate"], ["latest"]]);
+  const rejection = firstString(status, [["lastRejectionReason"], ["lastRejectReason"]]);
+  const minHolders = firstNumber(status, [["baseline", "minHolders"]]);
+  const minLiquidity = firstNumber(status, [["baseline", "minLiquidityUsd"]]);
+  const maxTop10 = firstNumber(status, [["baseline", "maxTop10HolderRate"], ["baseline", "maxTop10Pct"]]);
+  const minScans = firstNumber(status, [["trigger", "minScans"]]);
+  const holderGrowth = firstNumber(status, [["trigger", "minHolderGrowthPct"]]);
+  const configured = firstBoolean(status, [["configured"]]);
+  const state = enabled === false
+    ? "disabled"
+    : configured === false
+      ? "missing GMGN_API_KEY"
+      : `${mode ?? "gmgn"}${running === false ? " idle" : " running"}`;
+  const lines = [
+    `• status: ${escapeHtml(state)}${lastScanAt ? ` · last scan ${formatAgo(Date.now() - lastScanAt)}` : ""}`,
+    `• baseline: holders >= ${formatLooseCount(minHolders)} · liq >= ${minLiquidity == null ? "—" : fmtMcap(minLiquidity)}${maxTop10 != null ? ` · top10 <= ${maxTop10 > 1 ? maxTop10.toFixed(0) : (maxTop10 * 100).toFixed(0)}%` : ""}`,
+    `• tracking: ${formatLooseCount(watched)} watched · ${formatLooseCount(minScans)} scans · holder growth >= ${holderGrowth == null ? "—" : `${holderGrowth}%`}`,
     `• counts: seen ${formatLooseCount(counts.seen)} · filtered ${formatLooseCount(counts.filtered)} · accepted ${formatLooseCount(counts.accepted)}`,
     `• latest candidate: ${formatLooseCandidate(latest)}`,
     `• last rejection: ${rejection ? `<code>${escapeHtml(rejection)}</code>` : "—"}`,
@@ -889,8 +1025,11 @@ function sourceModeKeyboard(current: SourceMode): Array<Array<{ text: string; ca
     callback_data: `sources:mode:${mode}`,
   });
   return [
-    [button("scg_only"), button("okx_watch")],
-    [button("hybrid"), button("okx_only")],
+    // [SCG-DISABLED 2026-04-22] scg_only button hidden; re-enable alongside SOURCE_MODES.
+    // [button("scg_only"), button("okx_watch")],
+    [button("okx_watch"), button("hybrid")],
+    [button("okx_only"), button("gmgn_watch")],
+    [button("gmgn_live"), button("gmgn_only")],
     [{ text: "🔄 Refresh", callback_data: "sources:refresh" }],
   ];
 }
@@ -905,30 +1044,39 @@ async function sendSourcesMenu(chatId: number): Promise<void> {
   const filtered = recent.filter((e) => e.action === "filtered").length;
   const latest = recent[recent.length - 1];
   const lastRejected = [...recent].reverse().find((e) => e.action === "filtered" && e.reason);
-  const scgState = isPaused()
-    ? "paused"
-    : health.lastTickError
-      ? "error"
-      : health.lastTickOkAt
-        ? "polling"
-        : "starting";
+  // [SCG-DISABLED 2026-04-22] scgState/health/recent/filtered/fired/latest/lastRejected
+  // are still computed but not rendered in the sources menu while SCG is off.
+  // Uncomment the "SCG Alpha" lines block below to restore.
+  void isPaused; void health; void recent; void fired; void filtered; void latest; void lastRejected; void now;
+  // const scgState = isPaused()
+  //   ? "paused"
+  //   : health.lastTickError
+  //     ? "error"
+  //     : health.lastTickOkAt
+  //       ? "polling"
+  //       : "starting";
   const okxStatus = await getSafeOkxSignalStatus();
+  const gmgnStatus = await getSafeGmgnSignalStatus();
 
   const lines = [
     "🧭 <b>Signal sources</b>",
     "",
     `Active mode: <b>${SOURCE_MODE_LABELS[sourceMode]}</b> <code>${sourceMode}</code>`,
     "",
-    "<b>SCG Alpha</b>",
-    `• status: ${scgState} · last poll ${health.lastTickOkAt ? formatAgo(now - health.lastTickOkAt) : "never"} · HTTP ${health.lastHttpStatus ?? "—"}`,
-    `• counts: seen ${health.seenSize.toLocaleString("en-US")} · filtered ${filtered.toLocaleString("en-US")} · accepted ${fired.toLocaleString("en-US")} (recent ${recent.length})`,
-    `• latest candidate: ${latest ? `<code>${escapeHtml(latest.name)}</code> · ${latest.action}${latest.reason ? ` · ${escapeHtml(latest.reason)}` : ""}` : "—"}`,
-    `• last rejection: ${lastRejected?.reason ? `<code>${escapeHtml(lastRejected.reason)}</code>` : "—"}`,
-    "",
+    // [SCG-DISABLED 2026-04-22] SCG Alpha section hidden. Restore when re-enabling SCG.
+    // "<b>SCG Alpha</b>",
+    // `• status: ${scgState} · last poll ${health.lastTickOkAt ? formatAgo(now - health.lastTickOkAt) : "never"} · HTTP ${health.lastHttpStatus ?? "—"}`,
+    // `• counts: seen ${health.seenSize.toLocaleString("en-US")} · filtered ${filtered.toLocaleString("en-US")} · accepted ${fired.toLocaleString("en-US")} (recent ${recent.length})`,
+    // `• latest candidate: ${latest ? `<code>${escapeHtml(latest.name)}</code> · ${latest.action}${latest.reason ? ` · ${escapeHtml(latest.reason)}` : ""}` : "—"}`,
+    // `• last rejection: ${lastRejected?.reason ? `<code>${escapeHtml(lastRejected.reason)}</code>` : "—"}`,
+    // "",
     "<b>OKX discovery</b>",
     ...okxDiscoveryStatusLines(okxStatus),
     "",
-    "<i>Mode changes save to state/settings.json and ask OKX discovery to refresh.</i>",
+    "<b>GMGN scanner</b>",
+    ...gmgnDiscoveryStatusLines(gmgnStatus),
+    "",
+    "<i>Mode changes save to state/settings.json and ask source scanners to refresh.</i>",
   ];
 
   await tgPost("sendMessage", {
@@ -946,9 +1094,11 @@ async function handleSources(chatId: number, data?: string): Promise<string> {
     if (!isSourceMode(rawMode)) return "Unknown source mode";
     updateRuntimeSettings((draft) => {
       draft.signals.sourceMode = rawMode;
-      draft.signals.okx.enabled = rawMode !== "scg_only";
+      draft.signals.okx.enabled = rawMode === "okx_watch" || rawMode === "hybrid" || rawMode === "okx_only";
+      draft.signals.gmgn.enabled = rawMode === "gmgn_watch" || rawMode === "gmgn_live" || rawMode === "gmgn_only";
     });
     await refreshSafeOkxSignalSource();
+    await refreshSafeGmgnSignalSource();
     await sendSourcesMenu(chatId);
     logger.info({ sourceMode: rawMode }, "[settings] source mode updated via telegram");
     return `${SOURCE_MODE_LABELS[rawMode]} selected`;
@@ -956,6 +1106,7 @@ async function handleSources(chatId: number, data?: string): Promise<string> {
 
   if (data === "sources:refresh") {
     await refreshSafeOkxSignalSource();
+    await refreshSafeGmgnSignalSource();
     await sendSourcesMenu(chatId);
     return "Refreshed";
   }
@@ -966,6 +1117,7 @@ async function handleSources(chatId: number, data?: string): Promise<string> {
 
 async function handlePing(chatId: number): Promise<void> {
   const lines: string[] = ["🩺 <b>Connectivity check</b>"];
+  const sourceMode = getRuntimeSettings().signals.sourceMode;
 
   // Check 1 — upstream reachability. Fresh fetch, timed, with its own error
   // surface. This isolates network/DNS/TLS/auth from the running poller.
@@ -982,7 +1134,7 @@ async function handlePing(chatId: number): Promise<void> {
     clearTimeout(timeout);
     const latency = Date.now() - t0;
     if (!res.ok) {
-      lines.push(`1. Upstream API: ❌ HTTP ${res.status} ${escapeHtml(res.statusText)} (${latency}ms)`);
+      lines.push(`1. SCG upstream API: ❌ HTTP ${res.status} ${escapeHtml(res.statusText)} (${latency}ms)`);
     } else {
       const body = (await res.json().catch(() => ({}))) as ScgAlertsResponse;
       const alerts = Array.isArray(body?.alerts) ? body.alerts : [];
@@ -998,11 +1150,11 @@ async function handlePing(chatId: number): Promise<void> {
         newestAgeMins = newest.age_mins;
       }
       upstreamOk = true;
-      lines.push(`1. Upstream API: ✅ HTTP 200 · ${alerts.length} alerts · ${latency}ms`);
+      lines.push(`1. SCG upstream API: ✅ HTTP 200 · ${alerts.length} alerts · ${latency}ms`);
     }
   } catch (err) {
     const msg = (err as Error)?.message ?? String(err);
-    lines.push(`1. Upstream API: ❌ ${escapeHtml(msg)}`);
+    lines.push(`1. SCG upstream API: ❌ ${escapeHtml(msg)}`);
   }
 
   // Check 2 — poller is processing what it receives. Compare newest upstream
@@ -1016,24 +1168,27 @@ async function handlePing(chatId: number): Promise<void> {
   const pollerRecentlyOk = Number.isFinite(lastOkAgo) && lastOkAgo <= Math.max(CONFIG.SCG_POLL_MS * 2, 5_000);
 
   if (!upstreamOk) {
-    lines.push("2. Poller processing: ⚠️ skipped (upstream unreachable)");
+    lines.push("2. SCG poller processing: ⚠️ skipped (upstream unreachable)");
   } else if (upstreamAlertCount === 0) {
-    lines.push("2. Poller processing: ⚠️ upstream returned 0 alerts — nothing to verify");
+    lines.push("2. SCG poller processing: ⚠️ upstream returned 0 alerts — nothing to verify");
   } else if (newestKey && hasSeenAlert(newestKey)) {
     lines.push(
-      `2. Poller processing: ✅ newest upstream alert is in dedup set` +
+      `2. SCG poller processing: ✅ newest upstream alert is in dedup set` +
         (newestName ? ` (<code>${escapeHtml(newestName)}</code>, age ${newestAgeMins}m)` : ""),
     );
   } else if (pollerRecentlyOk && !health.lastTickError) {
     lines.push(
-      `2. Poller processing: ⚠️ newest upstream alert is not seen yet — poller is alive and may be one tick behind` +
+      `2. SCG poller processing: ⚠️ newest upstream alert is not seen yet — poller is alive and may be one tick behind` +
         (newestName ? ` (<code>${escapeHtml(newestName)}</code>)` : ""),
     );
   } else {
     lines.push(
-      `2. Poller processing: ❌ newest upstream alert NOT in dedup set — poller is behind or stalled` +
+      `2. SCG poller processing: ❌ newest upstream alert NOT in dedup set — poller is behind or stalled` +
         (newestName ? ` (<code>${escapeHtml(newestName)}</code>)` : ""),
     );
+  }
+  if (sourceMode === "okx_only" || sourceMode === "gmgn_only") {
+    lines.push(`   <i>SCG is health-checked only in ${escapeHtml(SOURCE_MODE_LABELS[sourceMode])}; active entries come from /sources status below.</i>`);
   }
 
   // Check 3 — Telegram delivery. The reply itself is the proof; say so.
@@ -1050,12 +1205,13 @@ async function handlePing(chatId: number): Promise<void> {
   lines.push(`• dedup set size: ${health.seenSize}`);
   lines.push(`• paused: ${paused ? "🟡 yes — run /resume" : "no"}`);
   lines.push(`• blacklisted mints: ${getBlacklist().length}`);
-  const sourceMode = getRuntimeSettings().signals.sourceMode;
   const okxDiscovery = await getSafeOkxSignalStatus();
+  const gmgnDiscovery = await getSafeGmgnSignalStatus();
   lines.push("");
   lines.push("<b>Signal sources</b>");
   lines.push(`• active mode: <b>${SOURCE_MODE_LABELS[sourceMode]}</b> <code>${sourceMode}</code>`);
   lines.push(...okxDiscoveryStatusLines(okxDiscovery).map((line) => `• OKX discovery ${line.slice(2)}`));
+  lines.push(...gmgnDiscoveryStatusLines(gmgnDiscovery).map((line) => `• GMGN scanner ${line.slice(2)}`));
   const wss = getOkxWsStatus();
   const wssLastEventAgo = wss.lastEventAt ? formatAgo(Date.now() - wss.lastEventAt) : "never";
   const wssLastPollAgo = wss.lastPollAt ? formatAgo(Date.now() - wss.lastPollAt) : "never";
@@ -1226,6 +1382,13 @@ async function handleStats(chatId: number): Promise<void> {
     .map(([k, v]) => `${k}: ${v >= 0 ? "+" : ""}${v.toFixed(2)}`)
     .join(" | ");
 
+  const sourceLines = stats.bySource
+    .map((s) => {
+      const pnl = s.avgPnlPct >= 0 ? `+${s.avgPnlPct.toFixed(1)}%` : `${s.avgPnlPct.toFixed(1)}%`;
+      return `  ${escapeHtml(s.source)}: ${(s.winRate * 100).toFixed(0)}% win | avg ${pnl} | ${s.count}`;
+    })
+    .join("\n");
+
   const lines: string[] = [
     `📊 <b>Signal Stats</b> — ${stats.totalTrades} trades with metadata`,
     "",
@@ -1236,6 +1399,8 @@ async function handleStats(chatId: number): Promise<void> {
     `<b>Win Rate by MCap Tier</b>`,
     tierLines,
     "",
+    sourceLines ? `<b>Win Rate by Source</b>\n${sourceLines}` : "",
+    sourceLines ? "" : "",
     corrTop ? `<b>Correlations w/ PnL</b>\n  ${corrTop}` : "",
     "",
     `<b>Active filter:</b> ${filterStr}`,
@@ -1316,7 +1481,9 @@ async function handleHistory(chatId: number, argText: string): Promise<void> {
     const sign = t.pnlSol >= 0 ? "+" : "";
     const icon = t.pnlSol >= 0 ? "🟢" : "🔴";
     const hold = t.holdSecs >= 3600 ? `${Math.floor(t.holdSecs/3600)}h` : t.holdSecs >= 60 ? `${Math.floor(t.holdSecs/60)}m` : `${t.holdSecs}s`;
-    return `${icon} <b>${escapeHtml(t.name)}</b>  ${sign}${t.pnlSol.toFixed(4)} SOL (${sign}${t.pnlPct.toFixed(0)}%)  ${escapeHtml(t.reason)} · ${hold}`;
+    const source = t.signalMeta?.source;
+    const sourceTag = source ? ` · ${escapeHtml(source)}` : "";
+    return `${icon} <b>${escapeHtml(t.name)}</b>  ${sign}${t.pnlSol.toFixed(4)} SOL (${sign}${t.pnlPct.toFixed(0)}%)  ${escapeHtml(t.reason)} · ${hold}${sourceTag}`;
   });
   await tgPost("sendMessage", {
     chat_id: chatId,
@@ -1399,7 +1566,7 @@ async function handleMcapFilter(chatId: number, argText: string): Promise<void> 
 }
 
 // ---------------------------------------------------------------------------
-// /skip <mint> — blacklist a token so SCG alerts for it are ignored.
+// /skip <mint> — blacklist a token so source alerts for it are ignored.
 // ---------------------------------------------------------------------------
 async function handleSkip(chatId: number, argText: string): Promise<void> {
   const mint = argText.trim();
@@ -1429,7 +1596,7 @@ async function handleSkip(chatId: number, argText: string): Promise<void> {
   logger.info({ mint }, "[telegram] added to blacklist");
   await tgPost("sendMessage", {
     chat_id: chatId,
-    text: `🚫 Added to blacklist: <code>${escapeHtml(mint)}</code>\nSCG alerts for this token will be ignored.`,
+    text: `🚫 Added to blacklist: <code>${escapeHtml(mint)}</code>\nSCG/OKX/GMGN alerts for this token will be ignored.`,
     parse_mode: "HTML",
   });
 }
@@ -1503,6 +1670,7 @@ function formatSetupStatusHtml(report: DoctorReport): string {
     "env:HELIUS_API_KEY",
     "env:PRIV_B58",
     "env:okx",
+    "env:gmgn",
     "env:telegram",
     "onchainos:version",
     "onchainos:hot-tokens",
@@ -1550,9 +1718,29 @@ async function handleSetupStatus(chatId: number): Promise<void> {
 let backtestInFlight = false;
 
 async function handleBacktest(chatId: number, argText: string = ""): Promise<void> {
-  // `/backtest` compares all deterministic exit modes against SCG alerts.
-  // `/backtest hybrid` preserves the moonbag-heavy trail grid.
-  const mode: "all" | "hybrid" = argText.trim().toLowerCase() === "hybrid" ? "hybrid" : "all";
+  // `/backtest [source] [hybrid]` — source ∈ {scg, gmgn}, strategy ∈ {all, hybrid}
+  // [SCG-DISABLED 2026-04-22] Default source flipped from "scg" to "gmgn" now
+  // that live SCG polling is off. You can still pass `scg` explicitly to backtest
+  // against the SCG upstream (fetchScgTokens is still defined in _backtest.ts),
+  // but the default CLI path no longer hits SCG.
+  //   /backtest                  → gmgn + all
+  //   /backtest hybrid           → gmgn + hybrid
+  //   /backtest gmgn             → gmgn + all
+  //   /backtest gmgn hybrid      → gmgn + hybrid
+  //   /backtest_hybrid           → gmgn + hybrid (alias of `/backtest hybrid`)
+  const tokens = argText
+    .trim()
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean);
+  let source: "scg" | "gmgn" = "gmgn";
+  let mode: "all" | "hybrid" = "all";
+  for (const tok of tokens) {
+    if (tok === "gmgn") source = "gmgn";
+    else if (tok === "scg") source = "scg";
+    else if (tok === "hybrid") mode = "hybrid";
+    else if (tok === "all") mode = "all";
+  }
 
   if (backtestInFlight) {
     await tgPost("sendMessage", {
@@ -1567,11 +1755,16 @@ async function handleBacktest(chatId: number, argText: string = ""): Promise<voi
   const llmWarning = CONFIG.LLM_EXIT_ENABLED
     ? "\n⚠️ <b>LLM exit advisor is ON.</b> LLM decisions are not candle-backtestable; this compares deterministic exits only."
     : "";
+  const sourceLabel = source === "gmgn" ? "GMGN" : "SCG";
+  const fetchBlurb =
+    source === "gmgn"
+      ? "Fetching GMGN signals/trenches/trending + OHLCV. Signal calls with timestamps use after-call candles; others use first-candle entry."
+      : "Fetching SCG alerts + OHLCV from signal time with at least ~24h runway when available.";
   const startMsg = await tgPost("sendMessage", {
     chat_id: chatId,
     text:
-      `🧪 <b>Running ${mode === "hybrid" ? "hybrid" : "exit strategy"} backtest...</b>\n` +
-      `<i>Fetching SCG alerts + OHLCV from signal time with at least ~24h runway when available.\n` +
+      `🧪 <b>Running ${mode === "hybrid" ? "hybrid" : "exit strategy"} backtest (${sourceLabel})...</b>\n` +
+      `<i>${fetchBlurb}\n` +
       `This takes ~60 seconds.</i>` +
       llmWarning,
     parse_mode: "HTML",
@@ -1579,13 +1772,13 @@ async function handleBacktest(chatId: number, argText: string = ""): Promise<voi
   const statusId = startMsg?.result?.message_id;
 
   try {
-    const { topResults, allResults, samplesUsed, tokensFetched, durationMs, source, resolutionCounts, entrySourceCounts } = await runBacktest({
+    const { topResults, allResults, samplesUsed, tokensFetched, durationMs, resolutionCounts, entrySourceCounts } = await runBacktest({
       bar: "5m",
       topN: 5,
       minCandles: 60,
       hybrid: mode === "hybrid",
       allStrategies: mode === "all",
-      source: "scg",
+      source,
     });
 
     if (!topResults.length) {
@@ -2187,11 +2380,11 @@ export function startTelegramBot(): () => void {
       { command: "mcapfilter", description: "Set MCap entry filter (e.g. /mcapfilter 50000 200000 or off)" },
       { command: "history",   description: "Last N closed trades (default 10)" },
       { command: "settings",  description: "Edit trading params live (no restart)" },
-      { command: "sources",   description: "Signal source mode + SCG/OKX discovery status" },
+      { command: "sources",   description: "Signal source mode + SCG/OKX/GMGN status" },
       { command: "llm",       description: "Toggle the LLM exit advisor on/off" },
       { command: "wss",       description: "OKX WSS status + open-position acceleration toggle" },
-      { command: "pause",     description: "Stop taking new SCG alerts" },
-      { command: "resume",    description: "Resume taking new SCG alerts" },
+      { command: "pause",     description: "Stop taking new entry alerts" },
+      { command: "resume",    description: "Resume taking new entry alerts" },
       { command: "ping",      description: "Check upstream alerts API + poller + Telegram" },
       { command: "sellall",   description: "Emergency close-all (requires CONFIRM)" },
       { command: "skip",      description: "Blacklist a mint (or list/clear)" },

@@ -140,11 +140,20 @@ export interface McapTierStat {
   medianPnlPct: number;
 }
 
+export interface SourceStat {
+  source: string;
+  count: number;
+  winRate: number;
+  avgPnlPct: number;
+  medianPnlPct: number;
+}
+
 export interface SignalStats {
   totalTrades: number;
   mcap: { mean: number; median: number; mode: number | null; min: number; max: number; stdev: number };
   byMcapTier: McapTierStat[];
   bestMcapTier: McapTierStat | null;
+  bySource: SourceStat[];
   correlations: Record<string, number>;
   activeFilter: { mcapMin: number; mcapMax: number };
 }
@@ -195,6 +204,27 @@ export async function getSignalStats(): Promise<SignalStats> {
     correlations[field] = _spearson(xs, pnls);
   }
 
+  const sources = new Map<string, ClosedTrade[]>();
+  for (const t of withMeta) {
+    const src = (t.signalMeta?.source ?? "scg").toLowerCase();
+    const bucket = sources.get(src) ?? [];
+    bucket.push(t);
+    sources.set(src, bucket);
+  }
+  const bySource: SourceStat[] = [...sources.entries()]
+    .map(([source, trades]) => {
+      const pnlVals = trades.map((t) => t.pnlPct);
+      const wins = trades.filter((t) => t.pnlPct > 0).length;
+      return {
+        source,
+        count: trades.length,
+        winRate: trades.length > 0 ? wins / trades.length : 0,
+        avgPnlPct: trades.length > 0 ? _smean(pnlVals) : 0,
+        medianPnlPct: trades.length > 0 ? _smedian(pnlVals) : 0,
+      };
+    })
+    .sort((a, b) => b.count - a.count);
+
   const { alertFilter } = getRuntimeSettings();
   return {
     totalTrades: withMeta.length,
@@ -208,6 +238,7 @@ export async function getSignalStats(): Promise<SignalStats> {
     },
     byMcapTier,
     bestMcapTier,
+    bySource,
     correlations,
     activeFilter: { mcapMin: alertFilter.mcapMin, mcapMax: alertFilter.mcapMax },
   };
@@ -496,6 +527,7 @@ export async function openPosition(alert: ScgAlert): Promise<Position | null> {
       rug_ratio:    alert.rug_ratio,
       liq_trend:    alert.liq_trend,
       score:        alert.score,
+      source:       alert.source ?? "scg",
     },
   };
   positions.set(alert.mint, position);

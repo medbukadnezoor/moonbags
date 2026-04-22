@@ -223,7 +223,7 @@ export function startScgPoller(onNew: AlertHandler): () => void {
         if (seen.has(k)) continue;
         remember(k);
         const settings = getRuntimeSettings();
-        if (settings.signals.sourceMode === "okx_only") {
+        if (settings.signals.sourceMode === "okx_only" || settings.signals.sourceMode === "gmgn_only") {
           recordEvent({
             at: Date.now(),
             mint: a.mint, name: a.name, score: a.score,
