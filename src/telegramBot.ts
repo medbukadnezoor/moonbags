@@ -1118,94 +1118,68 @@ async function handleSources(chatId: number, data?: string): Promise<string> {
 async function handlePing(chatId: number): Promise<void> {
   const lines: string[] = ["🩺 <b>Connectivity check</b>"];
   const sourceMode = getRuntimeSettings().signals.sourceMode;
-
-  // Check 1 — upstream reachability. Fresh fetch, timed, with its own error
-  // surface. This isolates network/DNS/TLS/auth from the running poller.
-  const t0 = Date.now();
-  let upstreamOk = false;
-  let newestKey: string | null = null;
-  let newestName: string | null = null;
-  let newestAgeMins: number | null = null;
-  let upstreamAlertCount = 0;
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10_000);
-    const res = await fetch(SCG_URL, { signal: controller.signal });
-    clearTimeout(timeout);
-    const latency = Date.now() - t0;
-    if (!res.ok) {
-      lines.push(`1. SCG upstream API: ❌ HTTP ${res.status} ${escapeHtml(res.statusText)} (${latency}ms)`);
-    } else {
-      const body = (await res.json().catch(() => ({}))) as ScgAlertsResponse;
-      const alerts = Array.isArray(body?.alerts) ? body.alerts : [];
-      upstreamAlertCount = alerts.length;
-      // Newest = largest alert_time. Don't assume API order.
-      let newest: ScgAlertsResponse["alerts"][number] | null = null;
-      for (const a of alerts) {
-        if (!newest || a.alert_time > newest.alert_time) newest = a;
-      }
-      if (newest) {
-        newestKey = alertKey(newest);
-        newestName = newest.name;
-        newestAgeMins = newest.age_mins;
-      }
-      upstreamOk = true;
-      lines.push(`1. SCG upstream API: ✅ HTTP 200 · ${alerts.length} alerts · ${latency}ms`);
-    }
-  } catch (err) {
-    const msg = (err as Error)?.message ?? String(err);
-    lines.push(`1. SCG upstream API: ❌ ${escapeHtml(msg)}`);
-  }
-
-  // Check 2 — poller is processing what it receives. Compare newest upstream
-  // alert against the poller's in-memory dedup set. If upstream has alert X
-  // and dedup doesn't contain X, the poller isn't processing even though the
-  // network is fine. Also surface pause state + last successful tick age.
-  const health = getPollerHealth();
-  const now = Date.now();
-  const lastOkAgo = health.lastTickOkAt ? now - health.lastTickOkAt : Infinity;
   const paused = isPaused();
-  const pollerRecentlyOk = Number.isFinite(lastOkAgo) && lastOkAgo <= Math.max(CONFIG.SCG_POLL_MS * 2, 5_000);
+  let checkNum = 0;
 
-  if (!upstreamOk) {
-    lines.push("2. SCG poller processing: ⚠️ skipped (upstream unreachable)");
-  } else if (upstreamAlertCount === 0) {
-    lines.push("2. SCG poller processing: ⚠️ upstream returned 0 alerts — nothing to verify");
-  } else if (newestKey && hasSeenAlert(newestKey)) {
-    lines.push(
-      `2. SCG poller processing: ✅ newest upstream alert is in dedup set` +
-        (newestName ? ` (<code>${escapeHtml(newestName)}</code>, age ${newestAgeMins}m)` : ""),
-    );
-  } else if (pollerRecentlyOk && !health.lastTickError) {
-    lines.push(
-      `2. SCG poller processing: ⚠️ newest upstream alert is not seen yet — poller is alive and may be one tick behind` +
-        (newestName ? ` (<code>${escapeHtml(newestName)}</code>)` : ""),
-    );
+  // Check 1 — GMGN reachability + API key validity.
+  if (process.env.GMGN_API_KEY?.trim()) {
+    checkNum++;
+    const t0 = Date.now();
+    try {
+      const { randomUUID } = await import("node:crypto");
+      const url = new URL("/v1/market/rank", process.env.GMGN_HOST?.trim() || "https://openapi.gmgn.ai");
+      url.searchParams.set("chain", "sol");
+      url.searchParams.set("interval", "5m");
+      url.searchParams.set("limit", "1");
+      url.searchParams.set("timestamp", String(Math.floor(Date.now() / 1000)));
+      url.searchParams.set("client_id", randomUUID());
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 8_000);
+      const res = await fetch(url, {
+        headers: { accept: "application/json", "X-APIKEY": process.env.GMGN_API_KEY.trim() },
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+      const latency = Date.now() - t0;
+      if (res.ok) {
+        lines.push(`${checkNum}. GMGN OpenAPI: ✅ HTTP 200 · ${latency}ms`);
+      } else {
+        const body = await res.text().catch(() => "");
+        const tag = (() => { try { const j = JSON.parse(body) as { error?: string }; return j.error ?? ""; } catch { return ""; } })();
+        lines.push(`${checkNum}. GMGN OpenAPI: ❌ HTTP ${res.status}${tag ? ` (${escapeHtml(tag)})` : ""} · ${latency}ms`);
+      }
+    } catch (err) {
+      lines.push(`${checkNum}. GMGN OpenAPI: ❌ ${escapeHtml((err as Error).message)}`);
+    }
   } else {
-    lines.push(
-      `2. SCG poller processing: ❌ newest upstream alert NOT in dedup set — poller is behind or stalled` +
-        (newestName ? ` (<code>${escapeHtml(newestName)}</code>)` : ""),
-    );
-  }
-  if (sourceMode === "okx_only" || sourceMode === "gmgn_only") {
-    lines.push(`   <i>SCG is health-checked only in ${escapeHtml(SOURCE_MODE_LABELS[sourceMode])}; active entries come from /sources status below.</i>`);
+    checkNum++;
+    lines.push(`${checkNum}. GMGN OpenAPI: ⚪ skipped (GMGN_API_KEY not set)`);
   }
 
-  // Check 3 — Telegram delivery. The reply itself is the proof; say so.
-  lines.push("3. Telegram delivery: ✅ (you're reading this message)");
+  // Check 2 — OKX signal source is actively running (means onchainos CLI + creds work).
+  checkNum++;
+  const okxDiscovery = await getSafeOkxSignalStatus();
+  const okxRunning = okxDiscovery.available && firstBoolean(okxDiscovery.status, [["running"]]) === true;
+  const okxSession = okxDiscovery.available ? firstString(okxDiscovery.status, [["sessionId"]]) : null;
+  if (okxRunning) {
+    lines.push(`${checkNum}. OKX onchainos: ✅ WSS session active${okxSession ? ` (${escapeHtml(okxSession.slice(0, 12))}…)` : ""}`);
+  } else if (okxDiscovery.available) {
+    const err = firstString(okxDiscovery.status, [["lastError"]]);
+    lines.push(`${checkNum}. OKX onchainos: ⚠️ session not running${err ? ` — <code>${escapeHtml(err)}</code>` : ""}`);
+  } else {
+    lines.push(`${checkNum}. OKX onchainos: ❌ ${escapeHtml(okxDiscovery.error ?? "unavailable")}`);
+  }
 
-  // Runtime state useful for diagnosing
+  // Check 3 — Telegram delivery. The reply itself is the proof.
+  checkNum++;
+  lines.push(`${checkNum}. Telegram delivery: ✅ (you're reading this message)`);
+
+  // Runtime state
   lines.push("");
-  lines.push("<b>Poller state</b>");
-  lines.push(`• last successful poll: ${formatAgo(lastOkAgo)}`);
-  lines.push(`• last HTTP status: ${health.lastHttpStatus ?? "—"}`);
-  if (health.lastTickError) {
-    lines.push(`• last error: <code>${escapeHtml(health.lastTickError)}</code>`);
-  }
-  lines.push(`• dedup set size: ${health.seenSize}`);
+  lines.push("<b>Bot state</b>");
   lines.push(`• paused: ${paused ? "🟡 yes — run /resume" : "no"}`);
   lines.push(`• blacklisted mints: ${getBlacklist().length}`);
-  const okxDiscovery = await getSafeOkxSignalStatus();
+
   const gmgnDiscovery = await getSafeGmgnSignalStatus();
   lines.push("");
   lines.push("<b>Signal sources</b>");
@@ -1226,9 +1200,8 @@ async function handlePing(chatId: number): Promise<void> {
   if (wss.lastError) {
     lines.push(`• last error: <code>${escapeHtml(wss.lastError)}</code>`);
   }
-  lines.push(...formatRecentPollerDecisions());
   lines.push(
-    `• runtime: node ${process.version} · ${process.platform}/${process.arch} · poll every ${CONFIG.SCG_POLL_MS}ms`,
+    `• runtime: node ${process.version} · ${process.platform}/${process.arch}`,
   );
 
   await tgPost("sendMessage", {

@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import os from "node:os";
 import { existsSync, readFileSync } from "node:fs";
 import { promisify } from "node:util";
@@ -108,6 +109,96 @@ async function fetchOk(url: string, init?: RequestInit): Promise<{ ok: boolean; 
   }
 }
 
+function checkSourceMode(env: EnvMap): DoctorCheck | null {
+  if (!existsSync("state/settings.json")) return null;
+  let sourceMode = "";
+  try {
+    const raw = JSON.parse(readFileSync("state/settings.json", "utf8")) as { signals?: { sourceMode?: string } };
+    sourceMode = raw.signals?.sourceMode ?? "";
+  } catch {
+    return {
+      id: "runtime:sourceMode",
+      label: "Source mode (state/settings.json)",
+      status: "warn",
+      detail: "unreadable",
+      fix: "state/settings.json is corrupt. Delete it and pick a mode via /sources on next boot.",
+    };
+  }
+  if (!sourceMode) return null;
+
+  if (sourceMode === "scg_only") {
+    return {
+      id: "runtime:sourceMode",
+      label: "Source mode",
+      status: "warn",
+      detail: `sourceMode="scg_only" (SCG is disabled — bot will fire zero buys)`,
+      fix: "Open /sources in Telegram and pick okx_only / okx_watch / gmgn_watch / gmgn_live / gmgn_only / hybrid.",
+    };
+  }
+
+  const needsOkx = ["okx_only", "okx_watch", "hybrid"].includes(sourceMode);
+  const needsGmgn = ["gmgn_only", "gmgn_live", "gmgn_watch", "hybrid"].includes(sourceMode);
+  const hasOkx = hasValue(env, "OKX_API_KEY") && hasValue(env, "OKX_SECRET_KEY") &&
+    (hasValue(env, "OKX_PASSPHRASE") || hasValue(env, "OKX_API_PASSPHRASE"));
+  const hasGmgn = hasValue(env, "GMGN_API_KEY");
+
+  if (needsOkx && !hasOkx) {
+    return {
+      id: "runtime:sourceMode",
+      label: "Source mode",
+      status: "fail",
+      detail: `sourceMode="${sourceMode}" requires OKX credentials`,
+      fix: "Add OKX_API_KEY / OKX_SECRET_KEY / OKX_PASSPHRASE to .env or switch to a GMGN-only mode in /sources.",
+    };
+  }
+  if (needsGmgn && !hasGmgn && !["hybrid"].includes(sourceMode)) {
+    return {
+      id: "runtime:sourceMode",
+      label: "Source mode",
+      status: "fail",
+      detail: `sourceMode="${sourceMode}" requires GMGN_API_KEY`,
+      fix: "Add GMGN_API_KEY to .env (get one at https://gmgn.ai/ai?chain=sol) or switch to an OKX-only mode.",
+    };
+  }
+
+  return {
+    id: "runtime:sourceMode",
+    label: "Source mode",
+    status: "ok",
+    detail: `sourceMode="${sourceMode}"`,
+  };
+}
+
+async function probeGmgn(apiKey: string, host?: string): Promise<{ ok: boolean; detail: string }> {
+  const base = host || "https://openapi.gmgn.ai";
+  const url = new URL("/v1/market/rank", base);
+  url.searchParams.set("chain", "sol");
+  url.searchParams.set("interval", "5m");
+  url.searchParams.set("limit", "1");
+  url.searchParams.set("timestamp", String(Math.floor(Date.now() / 1000)));
+  url.searchParams.set("client_id", randomUUID());
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      headers: { accept: "application/json", "X-APIKEY": apiKey },
+      signal: ac.signal,
+    });
+    const body = await res.text();
+    if (!res.ok) {
+      const errTag = (() => {
+        try { const j = JSON.parse(body) as { error?: string }; return j.error ?? ""; } catch { return ""; }
+      })();
+      return { ok: false, detail: `HTTP ${res.status}${errTag ? ` (${errTag})` : ""}` };
+    }
+    return { ok: true, detail: `HTTP ${res.status} · key accepted` };
+  } catch (err) {
+    return { ok: false, detail: (err as Error).message };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function checkEnvVars(env: EnvMap): DoctorCheck[] {
   const dryRun = (env.DRY_RUN ?? "true").trim().toLowerCase();
   const isDryRun = ["", "1", "true", "yes", "y", "on"].includes(dryRun);
@@ -202,17 +293,17 @@ function checkEnvVars(env: EnvMap): DoctorCheck[] {
     } else if (enabledFilters.length > 0 || risingLiq === true) {
       checks.push({
         id: "env:alert_filters",
-        label: "Entry alert filters",
+        label: "SCG-era alert filters (legacy)",
         status: "warn",
         detail: [...enabledFilters, ...(risingLiq === true ? ["REQUIRE_RISING_LIQ=true"] : [])].join(", "),
-        fix: "These filters can block entry signals. Set numeric filters to 0 and REQUIRE_RISING_LIQ=false for open SCG alerts.",
+        fix: "These env filters only affect the dormant SCG path. Safe to clear from .env. OKX/GMGN use /mcapfilter + sources-menu settings instead.",
       });
     } else {
       checks.push({
         id: "env:alert_filters",
-        label: "Entry alert filters",
+        label: "SCG-era alert filters (legacy)",
         status: "ok",
-        detail: "open defaults (0 disables numeric filters)",
+        detail: "unset (SCG is disabled; OKX/GMGN use /mcapfilter + /sources)",
       });
     }
   }
@@ -341,15 +432,21 @@ export async function runDoctor(options: { network?: boolean } = {}): Promise<Do
 
   checks.push(...checkEnvVars(env));
 
+  // Runtime sanity — what sourceMode is persisted, and does it have creds?
+  const sourceModeCheck = checkSourceMode(env);
+  if (sourceModeCheck) checks.push(sourceModeCheck);
+
   if (network) {
-    const scg = await fetchOk("https://api.scgalpha.com/api/alerts");
-    checks.push({
-      id: "network:scg",
-      label: "SCG Alpha feed",
-      status: scg.ok ? "ok" : "warn",
-      detail: scg.detail,
-      fix: scg.ok ? undefined : "Check internet/DNS. The bot cannot find new alerts while this feed is unreachable.",
-    });
+    if (hasValue(env, "GMGN_API_KEY")) {
+      const gmgn = await probeGmgn(env.GMGN_API_KEY!.trim(), env.GMGN_HOST?.trim());
+      checks.push({
+        id: "network:gmgn",
+        label: "GMGN OpenAPI",
+        status: gmgn.ok ? "ok" : "warn",
+        detail: gmgn.detail,
+        fix: gmgn.ok ? undefined : "Verify GMGN_API_KEY is valid and not rate-limit-banned. Check openapi.gmgn.ai reachability.",
+      });
+    }
 
     const rpcUrl = (env.RPC_URL || "https://beta.helius-rpc.com?api-key=${HELIUS_API_KEY}")
       .replace("${HELIUS_API_KEY}", env.HELIUS_API_KEY ?? "");
