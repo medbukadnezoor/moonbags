@@ -332,7 +332,7 @@ function formatPosition(p: Position, info?: TokenInfo | null, audit?: JupAudit |
   const header = `<u><b>${escapeHtml(p.name)}</b></u>${armed}${sourceTag}  <code>${escapeHtml(mintShort)}</code>  <a href="${gmgnUrl}">gmgn</a>`;
 
   // PnL row: bold percentage + peak + drawdown with · separators
-  const pnlRow = `${icon} <b>${pnlSign}${pnl.toFixed(1)}%</b>${sep}▲ peak +${peakPct}%${sep}▼ dd ${drawdown.toFixed(1)}%`;
+  const pnlRow = `${icon} <b><u>${pnlSign}${pnl.toFixed(1)}%</u></b>${sep}▲ peak +${peakPct}%${sep}▼ dd ${drawdown.toFixed(1)}%`;
 
   const lines: string[] = [header, pnlRow];
 
