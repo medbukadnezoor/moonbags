@@ -326,38 +326,40 @@ function formatPosition(p: Position, info?: TokenInfo | null, audit?: JupAudit |
   const sm = p.signalMeta;
 
   const pnlSign = pnl >= 0 ? "+" : "";
-  const lines: string[] = [
-    // Line 1: PnL dominant — bold and first
-    `${icon} <b>${pnlSign}${pnl.toFixed(1)}%</b>  ↑ peak +${peakPct}%  ↓ dd ${drawdown.toFixed(1)}%`,
-    // Line 2: name + source + mint + gmgn link
-    `<b>${escapeHtml(p.name)}</b>${armed}${sourceTag}  <code>${escapeHtml(mintShort)}</code>  <a href="${gmgnUrl}">gmgn</a>`,
-  ];
+  const sep = " · ";
 
+  // Header: underlined token name + source + mint + gmgn
+  const header = `<u><b>${escapeHtml(p.name)}</b></u>${armed}${sourceTag}  <code>${escapeHtml(mintShort)}</code>  <a href="${gmgnUrl}">gmgn</a>`;
+
+  // PnL row: bold percentage + peak + drawdown with · separators
+  const pnlRow = `${icon} <b>${pnlSign}${pnl.toFixed(1)}%</b>${sep}▲ peak +${peakPct}%${sep}▼ dd ${drawdown.toFixed(1)}%`;
+
+  const lines: string[] = [header, pnlRow];
+
+  // Market data block (blockquote)
+  const marketLines: string[] = [];
   if (info) {
-    // Line 3: price snapshot
     const snap: string[] = [];
     if (info.priceUsd > 0) snap.push(fmtUsd(info.priceUsd));
     if (info.mcapUsd > 0) snap.push(`MCap ${fmtUsd(info.mcapUsd)}`);
     if (info.liquidityUsd > 0) snap.push(`Liq ${fmtUsd(info.liquidityUsd)}`);
     if (info.holderCount > 0) snap.push(`👥 ${info.holderCount.toLocaleString()}`);
     if (info.organicScoreLabel) snap.push(`${escapeHtml(info.organicScoreLabel)}${info.verified ? " ✅" : ""}`);
-    if (snap.length > 0) lines.push(`📊 ${snap.join("  ·  ")}`);
+    if (snap.length > 0) marketLines.push(`📊 ${snap.join(sep)}`);
 
-    // Line 4: momentum — price changes + volume + buy/sell flow
     const mom: string[] = [];
     const c5 = info.priceChange5m, c1h = info.priceChange1h, c24h = info.priceChange24h;
-    if (c5 !== 0 || c1h !== 0 || c24h !== 0) {
-      mom.push(`5m ${fmtPct(c5)}`, `1h ${fmtPct(c1h)}`, `24h ${fmtPct(c24h)}`);
-    }
+    if (c5 !== 0 || c1h !== 0 || c24h !== 0) mom.push(`5m ${fmtPct(c5)}`, `1h ${fmtPct(c1h)}`, `24h ${fmtPct(c24h)}`);
     const vol1h = info.buyVolume1h + info.sellVolume1h;
     if (vol1h > 0) mom.push(`Vol ${fmtUsd(vol1h)}`);
     if (info.numTraders1h > 0) mom.push(`${info.numBuys1h}↑ ${info.numSells1h}↓`);
     if (audit?.organicVolumePct != null) mom.push(`orgVol ${audit.organicVolumePct.toFixed(0)}%`);
     if (audit?.organicBuyersPct != null) mom.push(`orgBuyers ${audit.organicBuyersPct.toFixed(0)}%`);
-    if (mom.length > 0) lines.push(`📈 ${mom.join("  ·  ")}`);
+    if (mom.length > 0) marketLines.push(`📈 ${mom.join(sep)}`);
   }
+  if (marketLines.length > 0) lines.push(`<blockquote>${marketLines.join("\n")}</blockquote>`);
 
-  // Line 5: risk/security — blend signalMeta (entry-time) with live audit
+  // Risk block (expandable — collapsed by default)
   const risk: string[] = [];
   const top10 = info?.audit.topHoldersPercentage ?? (sm?.top10_pct ?? 0);
   if (top10 > 0) risk.push(`top10 ${top10.toFixed(1)}%`);
@@ -371,7 +373,7 @@ function formatPosition(p: Position, info?: TokenInfo | null, audit?: JupAudit |
     if (a.devMints > 0) risk.push(`devMints ${a.devMints}`);
     if (a.isSus) risk.push(`🚨 suspicious`);
   }
-  if (risk.length > 0) lines.push(`🔒 ${risk.join("  ·  ")}`);
+  if (risk.length > 0) lines.push(`<blockquote expandable>🔒 ${risk.join(sep)}</blockquote>`);
 
   return lines.join("\n");
 }
