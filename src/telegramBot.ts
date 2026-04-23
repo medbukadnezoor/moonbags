@@ -1974,6 +1974,24 @@ async function handleBacktest(chatId: number, argText: string = ""): Promise<voi
 // ---------------------------------------------------------------------------
 let filterSweepInFlight = false;
 
+// Adopt-baseline state: registerFilterAdopt stashes the suggested baseline
+// under a short key; the "adopt:filter:<key>" callback reads it and applies
+// it via updateRuntimeSettings. Keys expire after 1h to avoid leaking.
+type PendingFilterAdopt = { source: "okx" | "gmgn"; baseline: Record<string, number>; at: number };
+const pendingFilterAdopts = new Map<string, PendingFilterAdopt>();
+const FILTER_ADOPT_TTL_MS = 60 * 60 * 1000;
+
+function registerFilterAdopt(source: "okx" | "gmgn", baseline: Record<string, number>): string {
+  // Prune expired entries cheaply on every registration.
+  const now = Date.now();
+  for (const [k, v] of pendingFilterAdopts) {
+    if (now - v.at > FILTER_ADOPT_TTL_MS) pendingFilterAdopts.delete(k);
+  }
+  const key = Math.random().toString(36).slice(2, 10);
+  pendingFilterAdopts.set(key, { source, baseline, at: now });
+  return key;
+}
+
 const TELEGRAM_SOFT_LIMIT = 3800;
 
 type NormalizedSweep = {
@@ -2262,12 +2280,27 @@ async function handleFilterSweep(chatId: number, source: "gmgn" | "okx"): Promis
       });
     }
 
-    await tgPost("sendMessage", {
-      chat_id: chatId,
-      text: suggestedText,
-      parse_mode: "HTML",
-      disable_web_page_preview: true,
-    });
+    if (suggestedKeys.length > 0) {
+      const adoptKey = registerFilterAdopt(source, suggested);
+      await tgPost("sendMessage", {
+        chat_id: chatId,
+        text: suggestedText,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+        reply_markup: {
+          inline_keyboard: [[
+            { text: `✅ Adopt ${sourceLabel} baseline`, callback_data: `adopt:filter:${adoptKey}` },
+          ]],
+        },
+      });
+    } else {
+      await tgPost("sendMessage", {
+        chat_id: chatId,
+        text: suggestedText,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      });
+    }
   } catch (err) {
     logger.warn({ err: (err as Error).message }, "[telegram] filter sweep failed");
     await tgPost("sendMessage", {
@@ -2429,6 +2462,42 @@ async function handleAdopt(chatId: number, data: string): Promise<void> {
   const parts = data.split(":");
   if (parts[1] === "cancel") {
     await tgPost("sendMessage", { chat_id: chatId, text: "❌ Cancelled. Config unchanged." });
+    return;
+  }
+  if (parts[1] === "filter") {
+    const key = parts[2];
+    const entry = key ? pendingFilterAdopts.get(key) : undefined;
+    if (!entry) {
+      await tgPost("sendMessage", {
+        chat_id: chatId,
+        text: "⚠️ Adopt link expired — run /backtest filter sweep again.",
+      });
+      return;
+    }
+    pendingFilterAdopts.delete(key!);
+    const { source, baseline } = entry;
+    const sourceLabel = source === "okx" ? "OKX" : "GMGN";
+    updateRuntimeSettings((draft) => {
+      if (source === "okx") {
+        const target = draft.signals.okx.discovery.baseline as unknown as Record<string, number>;
+        for (const [k, v] of Object.entries(baseline)) target[k] = v;
+      } else {
+        const target = draft.signals.gmgn.baseline as unknown as Record<string, number>;
+        for (const [k, v] of Object.entries(baseline)) target[k] = v;
+      }
+    });
+    const applied = Object.entries(baseline)
+      .map(([k, v]) => `  ${k}: ${v}`)
+      .join("\n");
+    await tgPost("sendMessage", {
+      chat_id: chatId,
+      text:
+        `✅ <b>Adopted ${sourceLabel} baseline</b>\n` +
+        `<pre>${escapeHtml(applied)}</pre>\n` +
+        `Applied live, persisted to state/settings.json.`,
+      parse_mode: "HTML",
+    });
+    logger.info({ source, applied: baseline }, "[settings] filter-sweep baseline adopted");
     return;
   }
   if (parts[1] === "fixed") {
