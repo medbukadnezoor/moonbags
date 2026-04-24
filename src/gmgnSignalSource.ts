@@ -4,7 +4,7 @@ import logger from "./logger.js";
 import type { ScgAlert } from "./types.js";
 import { checkSignalMintCooldown, markSignalMintAccepted } from "./sourceDedupe.js";
 import { getRuntimeSettings } from "./settingsStore.js";
-import { fetchJupAudit, passesJupGate } from "./jupGate.js";
+import { fetchJupAudit, passesJupGate, type JupGateConfig } from "./jupGate.js";
 import { isBlacklisted, isPaused, recordAlertEvent } from "./scgPoller.js";
 import {
   getMarketSignal,
@@ -1277,11 +1277,12 @@ type DeepDiveResult =
 // fields on the candidate (does not override richer seed data). Callers
 // should re-check baseline filters on the returned candidate.
 //
-// Also applies the GLOBAL Jupiter datapi audit gate (fees + organicScoreLabel)
-// before emit — Jup transient failures default to pass (see src/jupGate.ts).
+// Also applies the Jupiter datapi audit gate (fees + organicScoreLabel) before
+// emit. GMGN-specific: when Jup has no data for a token (not indexed — common
+// for new/small tokens), we pass through and rely on GMGN-native signals.
+// When Jup DOES have data, fees + scoreLabel are enforced as configured.
 //
-// Returns { ok:false, reason } if either request throws (safer to drop than
-// fire on partial data) or the Jup gate rejects.
+// Returns { ok:false, reason } if the Jup gate rejects on indexed tokens.
 async function deepDiveCandidate(seed: GmgnSignalCandidate): Promise<DeepDiveResult> {
   let info: Record<string, unknown> | null = null;
   let security: Record<string, unknown> | null = null;
@@ -1371,11 +1372,16 @@ async function deepDiveCandidate(seed: GmgnSignalCandidate): Promise<DeepDiveRes
   next.alert.score = next.score;
   next.alert.sourceMeta = next.sourceMeta;
 
-  // Global Jup audit gate — applied AFTER enrichment so all sources share
-  // the same fees + organicScoreLabel floor. Transient Jup failures pass.
+  // Jup audit gate — GMGN tokens are often not indexed by Jupiter (too new/small).
+  // When audit is null (not indexed), pass through: GMGN-native quality signals
+  // (holders, bundlerPct, hotLevel, top10Pct) already gate the token.
+  // When Jup DOES have data, enforce fees + score label as configured.
   const jupCfg = getRuntimeSettings().jupGate;
   const audit = await fetchJupAudit(seed.mint);
-  const gate = passesJupGate(audit, jupCfg);
+  const effectiveCfg: JupGateConfig = audit == null
+    ? { ...jupCfg, minFees: 0, allowedScoreLabels: [] }
+    : jupCfg;
+  const gate = passesJupGate(audit, effectiveCfg);
   if (!gate.ok) {
     return { ok: false, reason: gate.reason };
   }
