@@ -1272,7 +1272,7 @@ export async function tickLlmAdvisor(): Promise<void> {
   const llmPollMs = CONFIG.LLM_POLL_MS;
   const candidates = Array.from(positions.values()).filter((p) =>
     p.status === "open" &&
-    p.armed &&
+    (CONFIG.LLM_EXIT_IMMEDIATE || p.armed) &&
     !p.moonbagMode &&    // moonbag is disabled when LLM is on, but defensive
     (!p.lastLlmCheckAt || Date.now() - p.lastLlmCheckAt >= llmPollMs),
   );

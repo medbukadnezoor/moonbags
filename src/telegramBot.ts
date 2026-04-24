@@ -407,6 +407,7 @@ const SETTINGS_LABELS: Record<SettableKey, string> = {
   MAX_HOLD_SECS:            "⏱ Max hold",
   LLM_EXIT_ENABLED:         "🧠 LLM exit advisor",
   LLM_ENTRY_ENABLED:        "🚪 LLM entry gate",
+  LLM_EXIT_IMMEDIATE:       "⚡ LLM immediate exit",
   LLM_POLL_MS:              "🧠 LLM poll interval",
   MILESTONES_ENABLED:       "🎯 Milestones",
   MILESTONE_PCTS:           "🎯 Milestone %s",
@@ -811,6 +812,18 @@ async function handleCallback(cq: NonNullable<Update["callback_query"]>): Promis
     await tgPost("answerCallbackQuery", {
       callback_query_id: cq.id,
       text: `LLM exit advisor: ${now ? "🤖 ON" : "⚪️ OFF"}`,
+      show_alert: false,
+    });
+    await handleLlm(chatId, "");
+    return;
+  }
+
+  if (data === "llm_toggle_immediate") {
+    toggleConfigValue("LLM_EXIT_IMMEDIATE");
+    const now = CONFIG.LLM_EXIT_IMMEDIATE;
+    await tgPost("answerCallbackQuery", {
+      callback_query_id: cq.id,
+      text: `Immediate exit: ${now ? "⚡ ON" : "⚪️ OFF"}`,
       show_alert: false,
     });
     await handleLlm(chatId, "");
@@ -1793,19 +1806,25 @@ async function handleLlm(chatId: number, argText: string): Promise<void> {
   // Bare /llm — show status with toggle buttons
   const exitOn = CONFIG.LLM_EXIT_ENABLED;
   const entryOn = CONFIG.LLM_ENTRY_ENABLED;
+  const immediateOn = CONFIG.LLM_EXIT_IMMEDIATE;
   await tgPost("sendMessage", {
     chat_id: chatId,
     parse_mode: "HTML",
     text:
       `🧠 <b>LLM modes</b>\n\n` +
-      `🚪 Entry gate:  <b>${entryOn ? "🤖 ON" : "⚪️ OFF"}</b>\n` +
-      `📤 Exit advisor: <b>${exitOn ? "🤖 ON" : "⚪️ OFF"}</b>\n` +
+      `🚪 Entry gate:      <b>${entryOn ? "🤖 ON" : "⚪️ OFF"}</b>\n` +
+      `📤 Exit advisor:    <b>${exitOn ? "🤖 ON" : "⚪️ OFF"}</b>\n` +
+      `⚡ Immediate exit:  <b>${immediateOn ? "🤖 ON" : "⚪️ OFF"}</b>` +
+      (immediateOn ? `  <i>(LLM watches from entry, not just after arm)</i>` : "") + `\n` +
       (!keySet ? `\n⚠️ LLM_API_KEY is not set.` : `\n✅ API key set · model: ${CONFIG.LLM_MODEL}`),
     reply_markup: {
       inline_keyboard: [
         [
           { text: `${entryOn ? "🔴 Disable" : "🟢 Enable"} entry gate`, callback_data: "llm_toggle_entry" },
           { text: `${exitOn ? "🔴 Disable" : "🟢 Enable"} exit advisor`, callback_data: "llm_toggle_exit" },
+        ],
+        [
+          { text: `${immediateOn ? "🔴 Disable" : "🟢 Enable"} immediate exit`, callback_data: "llm_toggle_immediate" },
         ],
       ],
     },
