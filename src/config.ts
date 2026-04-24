@@ -1,4 +1,6 @@
 import dotenv from "dotenv";
+import fs from "fs";
+import path from "path";
 
 dotenv.config();
 
@@ -125,6 +127,10 @@ export const CONFIG = ({
   MILESTONE_PCTS: numList("MILESTONE_PCTS", [100, 200, 500, 1000]),
   DRY_RUN,
 });
+
+// Apply persisted toggles on top of env defaults (must happen after CONFIG is built).
+// Wrapped in try/catch so a bad flags file never prevents startup.
+try { loadRuntimeFlags(); } catch { /* ignored */ }
 
 export type Config = typeof CONFIG;
 
@@ -275,6 +281,40 @@ export const SETTABLE_SPECS: Record<SettableKey, Spec> = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// Runtime flag persistence — survives bot restarts.
+// LLM toggles and other boolean SettableKeys listed here are written to
+// state/runtimeFlags.json on every change and reloaded at startup.
+// ---------------------------------------------------------------------------
+const RUNTIME_FLAGS_PATH = path.resolve("state/runtimeFlags.json");
+const PERSISTED_FLAGS = new Set<SettableKey>(["LLM_EXIT_ENABLED", "LLM_ENTRY_ENABLED", "LLM_EXIT_IMMEDIATE"]);
+
+function loadRuntimeFlags(): void {
+  try {
+    const raw = fs.readFileSync(RUNTIME_FLAGS_PATH, "utf8");
+    const obj = JSON.parse(raw) as Record<string, unknown>;
+    for (const key of PERSISTED_FLAGS) {
+      if (typeof obj[key] === "boolean") {
+        (CONFIG as unknown as Record<string, unknown>)[key] = obj[key];
+      }
+    }
+  } catch {
+    // File missing or corrupt — use env/default values.
+  }
+}
+
+function saveRuntimeFlags(): void {
+  try {
+    const obj: Record<string, unknown> = {};
+    for (const key of PERSISTED_FLAGS) {
+      obj[key] = (CONFIG as unknown as Record<string, unknown>)[key];
+    }
+    fs.writeFileSync(RUNTIME_FLAGS_PATH, JSON.stringify(obj, null, 2));
+  } catch {
+    // Non-fatal.
+  }
+}
+
 export type SetConfigResult = { ok: true } | { ok: false; error: string };
 
 export function setConfigValue(key: SettableKey, raw: string): SetConfigResult {
@@ -300,6 +340,7 @@ export function setConfigValue(key: SettableKey, raw: string): SetConfigResult {
 
   // mutate in-memory CONFIG (typed as readonly but the object isn't frozen anymore)
   (CONFIG as unknown as Record<string, unknown>)[key] = parsed;
+  if (PERSISTED_FLAGS.has(key)) saveRuntimeFlags();
   return { ok: true };
 }
 

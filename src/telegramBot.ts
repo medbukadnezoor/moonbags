@@ -714,9 +714,10 @@ async function sendStartMenu(chatId: number): Promise<void> {
     if (!keySet) return `🧠 LLM: <i>no API key set</i>`;
     const parts: string[] = [];
     if (entryOn) parts.push("🚪 entry");
-    if (exitOn) parts.push(`📤 exit${immediateOn ? " ⚡immediate" : ""}`);
+    if (exitOn) parts.push("📤 exit");
+    if (immediateOn) parts.push("⚡ immediate");
     return parts.length > 0
-      ? `🧠 LLM: <b>${parts.join("  +  ")}</b>`
+      ? `🧠 LLM: <b>${parts.join("  ·  ")}</b>`
       : `🧠 LLM: ⚪️ all off  <i>(/llm to enable)</i>`;
   })();
 
