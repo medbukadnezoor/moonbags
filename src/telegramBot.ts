@@ -2047,7 +2047,8 @@ async function handleReclaim(chatId: number): Promise<void> {
       `Empty found: ${result.empty}\n` +
       `Closed: <b>${result.closed}</b>\n` +
       (result.failed > 0 ? `Failed: ${result.failed}\n` : ``) +
-      `\nReclaimed: <b>+${solReclaimed} SOL</b>`,
+      `\nReclaimed: <b>+${solReclaimed} SOL</b>` +
+      (result.firstError ? `\n\n⚠️ Error: <code>${escapeHtml(result.firstError.slice(0, 200))}</code>` : ``),
     parse_mode: "HTML",
   });
 }

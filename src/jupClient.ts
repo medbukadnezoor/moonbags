@@ -119,6 +119,7 @@ export type ReclaimResult = {
   closed: number;
   failed: number;
   reclaimedLamports: number;
+  firstError?: string;
 };
 
 type ParsedTokenInfo = { parsed?: { info?: { tokenAmount?: { amount?: string } } } };
@@ -153,8 +154,9 @@ async function closeAccountsBatch(
   kp: Keypair,
   accounts: Array<{ pubkey: PublicKey; lamports: number }>,
   programId: PublicKey,
-): Promise<{ closed: number; failed: number; reclaimedLamports: number }> {
+): Promise<{ closed: number; failed: number; reclaimedLamports: number; firstError?: string }> {
   let closed = 0, failed = 0, reclaimedLamports = 0;
+  let firstError: string | undefined;
   const BATCH = 20;
   for (let i = 0; i < accounts.length; i += BATCH) {
     const batch = accounts.slice(i, i + BATCH);
@@ -196,13 +198,15 @@ async function closeAccountsBatch(
           reclaimedLamports += lamports;
           closed++;
         } catch (err) {
-          logger.warn({ account: pubkey.toBase58(), err: String(err) }, "[reclaim] single close failed");
+          const msg = err instanceof Error ? err.message : String(err);
+          if (!firstError) firstError = msg;
+          logger.warn({ account: pubkey.toBase58(), err: msg }, "[reclaim] single close failed");
           failed++;
         }
       }
     }
   }
-  return { closed, failed, reclaimedLamports };
+  return { closed, failed, reclaimedLamports, firstError };
 }
 
 export async function reclaimEmptyTokenAccounts(): Promise<ReclaimResult> {
@@ -228,6 +232,7 @@ export async function reclaimEmptyTokenAccounts(): Promise<ReclaimResult> {
     result.closed = r1.closed + r2.closed;
     result.failed = r1.failed + r2.failed;
     result.reclaimedLamports = r1.reclaimedLamports + r2.reclaimedLamports;
+    result.firstError = r1.firstError ?? r2.firstError;
 
     logger.info(
       { scanned: result.scanned, empty: result.empty, closed: result.closed, failed: result.failed, reclaimedSol: (result.reclaimedLamports / 1e9).toFixed(4) },
