@@ -43,7 +43,7 @@ const MIN_CANDLES = parseInt(arg("--min-candles", "60"));   // ~5 hours of 5m da
 const STRATEGY    = arg("--strategy", "all");               // "all" | "simple" | "hybrid" | "protective"
 // [SCG-DISABLED 2026-04-22] CLI default flipped from "scg" to "gmgn".
 const SOURCE      = arg("--source", "gmgn");                // "scg" | "hot" | "gmgn" | "okx"
-const FEE_BPS     = parseInt(arg("--fee-bps", "50"));         // Ultra platform fee per swap (50 bps = 0.5%)
+const FEE_BPS     = parseInt(arg("--fee-bps", "50"));         // backtest fee estimate per swap (50 bps = 0.5%)
 const SLIPPAGE_BPS = parseInt(arg("--slippage-bps", "150"));  // estimated slippage per swap (150 bps = 1.5%)
 
 // Grid — keep tight to avoid huge run times; adjust freely

@@ -98,7 +98,12 @@ async function fileExists(p: string): Promise<boolean> {
 // ---------------------------------------------------------------------------
 async function testJupiterKey(key: string): Promise<boolean> {
   try {
-    const res = await fetch("https://api.jup.ag/ultra/v1/balances?wallet=So11111111111111111111111111111111111111112", {
+    const q = new URLSearchParams({
+      inputMint: "So11111111111111111111111111111111111111112",
+      outputMint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      amount: "1000000",
+    });
+    const res = await fetch(`https://api.jup.ag/swap/v2/order?${q.toString()}`, {
       headers: { "x-api-key": key },
     });
     return res.status !== 401 && res.status !== 403;
@@ -235,7 +240,7 @@ async function main(): Promise<void> {
 
   // 3. Jupiter API key
   section("Jupiter API key", 3);
-  console.log(gray("   Jupiter Ultra provides swap routing (buy/sell execution)."));
+  console.log(gray("   Jupiter Swap V2 provides managed /order + /execute swap routing."));
   console.log(`   Get one at:  ${blue("https://developers.jup.ag/portal")}`);
   console.log("");
   const jupFromEnv = existingEnv.match(/^JUP_API_KEY=(.*)$/m)?.[1];

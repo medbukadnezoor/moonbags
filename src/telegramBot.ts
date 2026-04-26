@@ -3624,7 +3624,12 @@ export function startTelegramBot(): () => void {
   async function loop(): Promise<void> {
     while (!stopped) {
       try {
-        const res = await fetch(apiUrl("getUpdates") + `?timeout=25&offset=${offset}`);
+        const params = new URLSearchParams({
+          timeout: "25",
+          offset: String(offset),
+          allowed_updates: JSON.stringify(["message", "callback_query"]),
+        });
+        const res = await fetch(`${apiUrl("getUpdates")}?${params.toString()}`);
         const json = (await res.json()) as { ok: boolean; result?: Update[] };
 
         if (!json.ok || !json.result) {

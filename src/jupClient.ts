@@ -1,6 +1,6 @@
 import { CONFIG, SOL_MINT, JUP_BASE } from "./config.js";
 import logger from "./logger.js";
-import type { JupOrderResponse, JupExecuteResponse } from "./types.js";
+import type { JupExecutableOrderResponse, JupOrderResponse, JupExecuteResponse } from "./types.js";
 import {
   Keypair,
   VersionedTransaction,
@@ -15,37 +15,11 @@ import bs58 from "bs58";
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
 const TOKEN_PROGRAM_ID_PK = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 
-// ---------------------------------------------------------------------------
-// Jupiter Referral Program — BAKED IN (not an env setting).
-//
-// Every Ultra /order call this bot makes passes `referralAccount` + `referralFee`.
-// Jupiter's fee-mint priority system picks which token the fee is taken in;
-// since every swap this bot does has SOL on one side (BUY = SOL→meme,
-// SELL = meme→SOL), fees land in SOL in practice.
-//
-// PREREQUISITE — do this ONCE per Solana wallet that owns the referral:
-//   1. Go to https://referral.jup.ag and create a Referral account (save the pubkey).
-//   2. From the same dashboard, create a ReferralTokenAccount for
-//      WSOL mint `So11111111111111111111111111111111111111112`. This is the
-//      on-chain bucket that fees accumulate into.
-//   3. Paste the Referral account pubkey into REFERRAL_ACCOUNT below.
-//   4. Claim fees anytime via the dashboard's "Claim All" button.
-//
-// Setting REFERRAL_ACCOUNT to "" disables the referral fee entirely (useful
-// for local dev / dry-run). Public forks earn fees for whoever's pubkey is
-// pasted here — so if you fork, edit this.
-//
-// Jupiter docs warn: `referralAccount` disables RFQ routing. For pump.fun
-// meme tokens this is a non-factor (RFQ isn't a thing on those AMMs).
-// ---------------------------------------------------------------------------
-const REFERRAL_ACCOUNT = "7mqRQMFQqhE1sSN8jZYkiBaXNqWxQFgJwkYaxtaNV81Q";
-const REFERRAL_FEE_BPS = 50;          // 50 bps = 0.5% — Jupiter Ultra MINIMUM is 50 bps; 25 is rejected at /order
-
 export interface GetOrderParams {
   inputMint: string;
   outputMint: string;
   amountRaw: bigint;
-  taker: string;
+  taker?: string;
   [k: string]: unknown;
 }
 
@@ -312,20 +286,13 @@ export async function getTokenDecimals(mint: string): Promise<number> {
   return 6;
 }
 
-export async function getOrder(params: GetOrderParams): Promise<JupOrderResponse> {
+async function getOrderQuote(params: GetOrderParams): Promise<JupOrderResponse> {
   const q = new URLSearchParams({
     inputMint: params.inputMint,
     outputMint: params.outputMint,
     amount: params.amountRaw.toString(),
-    taker: params.taker,
   });
-  // Attach Jupiter referral fee (baked-in constants above). Fee lands in SOL
-  // because every swap this bot makes has SOL on one side. Skip when the
-  // pubkey constant is empty.
-  if (REFERRAL_ACCOUNT && REFERRAL_FEE_BPS > 0) {
-    q.set("referralAccount", REFERRAL_ACCOUNT);
-    q.set("referralFee", String(REFERRAL_FEE_BPS));
-  }
+  if (params.taker) q.set("taker", params.taker);
   const url = `${JUP_BASE}/order?${q.toString()}`;
   const res = await fetch(url, {
     method: "GET",
@@ -339,10 +306,22 @@ export async function getOrder(params: GetOrderParams): Promise<JupOrderResponse
     throw new Error(`jup getOrder ${res.status}: ${body}`);
   }
   const json = (await res.json()) as JupOrderResponse;
+  if (!json.outAmount) {
+    throw new Error(`jup getOrder returned empty/invalid outAmount field: ${JSON.stringify(json).slice(0, 300)}`);
+  }
+  logger.debug(
+    { router: json.router, mode: json.mode, feeBps: json.feeBps, feeMint: json.feeMint, hasTransaction: Boolean(json.transaction) },
+    "jup getOrder route",
+  );
+  return json;
+}
+
+export async function getOrder(params: GetOrderParams): Promise<JupExecutableOrderResponse> {
+  const json = await getOrderQuote(params);
   if (!json.transaction || typeof json.transaction !== "string" || json.transaction.length < 20) {
     throw new Error(`jup getOrder returned empty/invalid transaction field: ${JSON.stringify(json).slice(0, 300)}`);
   }
-  return json;
+  return json as JupExecutableOrderResponse;
 }
 
 export async function executeOrder(
@@ -363,6 +342,11 @@ export async function executeOrder(
     throw new Error(`jup executeOrder ${res.status}: ${body}`);
   }
   return (await res.json()) as JupExecuteResponse;
+}
+
+function executedOutputAmountRaw(exec: JupExecuteResponse, fallbackOutAmount: string): bigint {
+  const raw = exec.outputAmountResult || fallbackOutAmount;
+  return BigInt(raw);
 }
 
 export async function quoteTokenToSol(
@@ -407,11 +391,10 @@ async function buyOnce(
   solLamports: bigint,
 ): Promise<{ signature: string; tokensReceivedRaw: bigint; tokenDecimals: number } | null> {
   if (CONFIG.DRY_RUN) {
-    const order = await getOrder({
+    const order = await getOrderQuote({
       inputMint: SOL_MINT,
       outputMint: mint,
       amountRaw: solLamports,
-      taker: "11111111111111111111111111111111",
     });
     const tokenDecimals = await getTokenDecimals(mint);
     logger.info({ mint, solLamports: solLamports.toString(), outAmount: order.outAmount }, "[DRY_RUN] buy");
@@ -439,7 +422,7 @@ async function buyOnce(
   const tokenDecimals = await getTokenDecimals(mint);
   return {
     signature: exec.signature ?? "",
-    tokensReceivedRaw: BigInt(order.outAmount),
+    tokensReceivedRaw: executedOutputAmountRaw(exec, order.outAmount),
     tokenDecimals,
   };
 }
@@ -475,11 +458,10 @@ export async function sellTokenForSol(
 ): Promise<{ signature: string; solReceivedLamports: bigint } | null> {
   try {
     if (CONFIG.DRY_RUN) {
-      const order = await getOrder({
+      const order = await getOrderQuote({
         inputMint: mint,
         outputMint: SOL_MINT,
         amountRaw: tokenAmountRaw,
-        taker: "11111111111111111111111111111111",
       });
       logger.info(
         { mint, tokenAmountRaw: tokenAmountRaw.toString(), outAmount: order.outAmount },
@@ -508,7 +490,7 @@ export async function sellTokenForSol(
     }
     return {
       signature: exec.signature ?? "",
-      solReceivedLamports: BigInt(order.outAmount),
+      solReceivedLamports: executedOutputAmountRaw(exec, order.outAmount),
     };
   } catch (err) {
     logger.error({ mint, err: (err as Error).message }, "sellTokenForSol failed");

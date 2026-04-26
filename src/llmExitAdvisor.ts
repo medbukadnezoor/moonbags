@@ -143,6 +143,14 @@ const MINIMAX_MODEL = CONFIG.LLM_MODEL;
 const HTTP_TIMEOUT_MS = 45_000;
 const MAX_OUTPUT_TOKENS = 2000;
 
+function shouldRequestReasoningSplit(endpoint: string): boolean {
+  try {
+    return new URL(endpoint).hostname === "api.minimax.io";
+  } catch {
+    return endpoint.includes("api.minimax.io");
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Prompt
 // ---------------------------------------------------------------------------
@@ -1045,24 +1053,27 @@ async function callMinimax(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
   try {
+    const body: Record<string, unknown> = {
+      model: MINIMAX_MODEL,
+      messages,
+      tools: [SUBMIT_DECISION_TOOL],
+      tool_choice: { type: "function", function: { name: "submit_decision" } },
+      temperature: 0.2,
+      max_tokens: MAX_OUTPUT_TOKENS,
+    };
+    if (shouldRequestReasoningSplit(MINIMAX_ENDPOINT)) {
+      // M2.7 has native interleaved thinking. Keeping thinking content out of
+      // message.content prevents <think> blocks from eating the tool-call JSON budget.
+      body.extra_body = { reasoning_split: true };
+    }
+
     const res = await fetch(MINIMAX_ENDPOINT, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${apiKey}`,
       },
-      body: JSON.stringify({
-        model: MINIMAX_MODEL,
-        messages,
-        tools: [SUBMIT_DECISION_TOOL],
-        tool_choice: { type: "function", function: { name: "submit_decision" } },
-        temperature: 0.2,
-        max_tokens: MAX_OUTPUT_TOKENS,
-        // M2.7 has native interleaved thinking. Setting reasoning_split=true via
-        // extra_body keeps thinking content out of message.content, which prevents
-        // the <think> block from eating the tool-call JSON budget.
-        extra_body: { reasoning_split: true },
-      }),
+      body: JSON.stringify(body),
       signal: controller.signal,
     });
 

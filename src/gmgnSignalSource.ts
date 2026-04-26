@@ -257,7 +257,7 @@ const DEFAULT_SETTINGS: GmgnSettings = {
     maxMarketCapUsd: 0,
     minLiquidityUsd: 10_000,
     minHolders: 150,
-    minTokenAgeMins: 5,
+    minTokenAgeMins: 0,
     maxTokenAgeMins: 240,
     minSmartMoneyCount: 0,
     minKolCount: 0,
@@ -967,11 +967,11 @@ function baseSeedFromRow(source: GmgnSourceKind, chain: GmgnChain, row: GmgnRow)
   const name = getStringField(row, ["name", "symbol", "token_name"]) ?? mint.slice(0, 8);
   const symbol = getStringField(row, ["symbol"]);
   const logo = getStringField(row, ["logo", "image", "icon"]);
-  const timestamp =
-    normalizeTimestamp(
-      getStringField(row, ["trigger_at", "timestamp", "time", "ts", "creation_timestamp", "created_at", "createdAt", "open_timestamp"]) ??
-        Date.now(),
-    );
+  // getStringField only handles string values (text() returns "" for numbers),
+  // so read timestamp fields directly from the row to handle numeric timestamps.
+  const TIMESTAMP_KEYS = ["trigger_at", "timestamp", "time", "ts", "creation_timestamp", "created_at", "createdAt", "open_timestamp"];
+  const rawTimestamp = TIMESTAMP_KEYS.map((k) => row[k]).find((v) => v != null && v !== "") ?? Date.now();
+  const timestamp = normalizeTimestamp(rawTimestamp);
 
   const marketCapUsd = parseNumber(
     getStringField(row, ["market_cap", "marketCap", "marketCapUsd", "marketcap", "mcap", "liquidity_market_cap"]) ??

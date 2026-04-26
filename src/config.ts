@@ -5,7 +5,7 @@ import path from "path";
 dotenv.config();
 
 export const SOL_MINT = "So11111111111111111111111111111111111111112";
-export const JUP_BASE = "https://api.jup.ag/ultra/v1";
+export const JUP_BASE = "https://api.jup.ag/swap/v2";
 
 function num(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -51,6 +51,24 @@ function resolveRpcUrl(): string {
 }
 
 const DRY_RUN = bool("DRY_RUN", true);
+
+const LLM_ENDPOINT = str("LLM_ENDPOINT") ?? "https://api.minimax.io/v1/chat/completions";
+const LLM_MODEL = str("LLM_MODEL") ?? "MiniMax-M2.7";
+const MINIMAX_API_KEY = str("MINIMAX_API_KEY") ?? "";
+const NVIDIA_API_KEY = str("NVIDIA_API_KEY") ?? "";
+
+function isNvidiaLlmEndpoint(endpoint: string): boolean {
+  try {
+    return new URL(endpoint).hostname.endsWith("api.nvidia.com");
+  } catch {
+    return endpoint.includes("api.nvidia.com");
+  }
+}
+
+const LLM_API_KEY =
+  isNvidiaLlmEndpoint(LLM_ENDPOINT) && NVIDIA_API_KEY
+    ? NVIDIA_API_KEY
+    : str("LLM_API_KEY") ?? MINIMAX_API_KEY;
 
 const JUP_API_KEY = str("JUP_API_KEY");
 const HELIUS_API_KEY = str("HELIUS_API_KEY");
@@ -101,7 +119,7 @@ export const CONFIG = ({
   REQUIRE_RISING_LIQ: bool("REQUIRE_RISING_LIQ", false),
   SCG_POLL_MS: num("SCG_POLL_MS", 3000),
   PRICE_POLL_MS: num("PRICE_POLL_MS", 2000),
-  SLIPPAGE_BPS: num("SLIPPAGE_BPS", 0), // unused with Ultra (automatic slippage via RTSE)
+  SLIPPAGE_BPS: num("SLIPPAGE_BPS", 0), // unused with managed /order (automatic slippage via RTSE)
   MOONBAG_PCT: num("MOONBAG_PCT", 0),
   MB_TRAIL_PCT: num("MB_TRAIL_PCT", 0.60),
   MB_TIMEOUT_SECS: num("MB_TIMEOUT_SECS", 7200),
@@ -116,10 +134,10 @@ export const CONFIG = ({
   // LLM provider — defaults to MiniMax for backwards compat.
   // Set LLM_API_KEY + LLM_ENDPOINT + LLM_MODEL to use any OpenAI-compatible
   // provider (e.g. OpenRouter: https://openrouter.ai/api/v1/chat/completions).
-  MINIMAX_API_KEY: str("MINIMAX_API_KEY") ?? "",
-  LLM_API_KEY: str("LLM_API_KEY") ?? str("MINIMAX_API_KEY") ?? "",
-  LLM_ENDPOINT: str("LLM_ENDPOINT") ?? "https://api.minimax.io/v1/chat/completions",
-  LLM_MODEL: str("LLM_MODEL") ?? "MiniMax-M2.7",
+  MINIMAX_API_KEY,
+  LLM_API_KEY,
+  LLM_ENDPOINT,
+  LLM_MODEL,
   // Milestone alerts — when a position crosses one of these PnL % thresholds
   // on its way up, send a Telegram notification with a force-sell button.
   // Default [100, 200, 500, 1000] = 2x / 3x / 6x / 11x.

@@ -6,6 +6,10 @@ state/
 logs/
 *.log
 
+# Workflow Manager v2 continuity; keep runtime state/ ignored above.
+!.specify/state/
+!.specify/state/**
+
 # === Build artifacts ===
 node_modules/
 frontend/node_modules/
@@ -17,6 +21,10 @@ dist/
 
 # === Dev-time data ===
 backtest_*.csv
+data/raw/telegram/
+data/processed/latest_telegram_run.json
+data/processed/telegram_*.json
+reports/latest_telegram_*.md
 
 # === Editor / OS ===
 .DS_Store

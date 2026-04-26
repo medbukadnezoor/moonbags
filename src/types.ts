@@ -99,18 +99,38 @@ export interface Position {
 
 export interface JupOrderResponse {
   requestId: string;
-  transaction: string;
+  transaction?: string | null;
   inAmount: string;
   outAmount: string;
   otherAmountThreshold: string;
   priceImpactPct: string;
   routePlan: unknown;
+  feeBps?: number;
+  feeMint?: string;
+  router?: "iris" | "jupiterz" | "dflow" | "okx" | string;
+  mode?: "ultra" | "manual" | string;
+  platformFee?: unknown;
+  totalTime?: number;
   [k: string]: unknown;
 }
+
+export type JupExecutableOrderResponse = JupOrderResponse & { transaction: string };
 
 export interface JupExecuteResponse {
   signature?: string;
   status: "Success" | "Failed" | string;
+  code?: number;
   error?: string;
+  inputAmountResult?: string;
+  outputAmountResult?: string;
+  totalInputAmount?: string;
+  totalOutputAmount?: string;
+  swapEvents?: Array<{
+    inputMint?: string;
+    inputAmount?: string;
+    outputMint?: string;
+    outputAmount?: string;
+    [k: string]: unknown;
+  }>;
   [k: string]: unknown;
 }

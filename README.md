@@ -2,7 +2,7 @@
 
 > Solana meme-token auto-trading bot with LLM-powered exit decisions.
 
-MoonBags is the **execution and management layer** for Solana meme-token signals. It consumes real-time discovery streams from **OKX smart-money signals** and/or **GMGN's curated trenches + KOL call feeds**, buys via Jupiter Ultra, then manages exits with either a configurable trail/stop or — optionally — a MiniMax M2.7 LLM that reads live on-chain data (smart money flow, dev holdings, holder PnL, kline trends) every 30 seconds to decide when to sell.
+MoonBags is the **execution and management layer** for Solana meme-token signals. It consumes real-time discovery streams from **OKX smart-money signals** and/or **GMGN's curated trenches + KOL call feeds**, buys via Jupiter Swap V2 managed `/order` + `/execute`, then manages exits with either a configurable trail/stop or — optionally — a MiniMax M2.7 LLM that reads live on-chain data (smart money flow, dev holdings, holder PnL, kline trends) every 30 seconds to decide when to sell.
 
 Telegram `/sources` lets you pick between `okx_watch` / `okx_only` / `gmgn_watch` / `gmgn_live` / `gmgn_only` or `hybrid` at runtime, no restart. SCG Alpha is supported as a legacy source in the codebase but disabled by default. Whatever source creates the entry, MoonBags still sizes it, executes through Jupiter, watches it, and exits it with the same universal exit settings.
 
@@ -16,7 +16,7 @@ You operate the bot through a Telegram bot (`/start`, `/positions`, `/settings`,
 
 **Critical upstream dependencies — OKX and GMGN.** The active signal layers are OKX OnchainOS smart-money signals and GMGN OpenAPI's trenches/signal endpoints. SCG Alpha ([@scg_alpha on X](https://x.com/scg_alpha)) integration remains in the codebase but is disabled by default; re-enabling it requires uncommenting the `[SCG-DISABLED]`-tagged call sites. **I do not own, operate, or control OKX, GMGN, SCG Alpha, Jupiter, Helius, MiniMax, or Telegram**. If any provider changes API shape, rate-limits you, changes pricing, or shuts down, the affected intake or execution path can stop working until the code or provider is updated. You're also subject to each provider's terms of service.
 
-Other third-party services the bot depends on (any of which can break the bot if they change): **Jupiter Ultra** (swap execution + fees), **Helius RPC** (Solana reads), **OKX onchainos CLI** (on-chain data enrichment), **MiniMax** (LLM advisor, optional), **Telegram Bot API** (control + notifications).
+Other third-party services the bot depends on (any of which can break the bot if they change): **Jupiter Swap V2 Meta-Aggregator** (managed swap execution + platform fees), **Helius RPC** (Solana reads), **OKX onchainos CLI** (on-chain data enrichment), **MiniMax** (LLM advisor, optional), **Telegram Bot API** (control + notifications).
 
 Use at your own risk.
 
@@ -76,7 +76,7 @@ If you want to swap in your own discovery source, the signal-source interface is
 1. **Receives** live signals from OKX (websocket, ~3s after smart-wallet buys land) and/or GMGN (60s poll across trenches + smart-money calls).
    - Mode selected via `/sources`: `okx_only`, `gmgn_live`, `gmgn_only`, `hybrid`, or any of the watch-only variants.
    - SCG Alpha polling is present in the codebase but disabled by default.
-2. **Buys** new alerts that pass your local filters via Jupiter Ultra (Solana DEX aggregator), spending a fixed SOL amount per trade.
+2. **Buys** new alerts that pass your local filters via Jupiter Swap V2 managed `/order` + `/execute`, spending a fixed SOL amount per trade.
 3. **Tracks** every open position every 3 seconds — pulls live prices, updates the running peak, and checks for arm/trail/stop conditions.
 4. **Arms** a trailing stop once a position hits a profit threshold (default +50%).
 5. **Exits** based on either:
@@ -111,8 +111,8 @@ If you want to swap in your own discovery source, the signal-source interface is
                             ▼
    +-------------+   +-------------------+   +----------------+
    |   Jupiter   |<--+      MoonBags     +-->|   Solana RPC   |
-   |  Ultra API  |   |  (this repo, the  |   |    (Helius)    |
-   |  + 0.5% ref |   |   execution layer)|   +----------------+
+   | Swap V2 API |   |  (this repo, the  |   |    (Helius)    |
+   | /order+exec |   |   execution layer)|   +----------------+
    +-------------+   +-+-----------+-----+
                        |     |     |
        buy/sell swaps  |     |     |  on-chain data: smart money,
@@ -199,27 +199,46 @@ Keep `DRY_RUN=true` until `/doctor` and `/setup_status` are clean and you are co
 For a first dry run:
 
 ```bash
-npm run start
+npm run start:dry
 ```
 
-For a long-running install, use `pm2`:
+For a long-running dry run, use the repo-owned `pm2` shortcuts. They force
+`DRY_RUN=true` and run the PM2 process with the required name `moonbags` so
+Telegram `/update` can find it.
 
 ```bash
 npm install -g pm2
-pm2 start "npm run start" --name moonbags
-pm2 logs moonbags
-pm2 save
+npm run up
+npm run ps
+npm run tail
+npm run logs
+npm run save
 ```
 
 Useful restart commands:
 
 ```bash
-pm2 restart moonbags
-pm2 restart moonbags --update-env   # use after changing .env
-pm2 logs moonbags
+npm run re                          # use after changing .env or PATH
+npm run logs
 ```
 
-Once `pm2` is running, Telegram `/update` becomes the self-healing update path: it checks `origin/main`, shows incoming commits, refuses unsafe local changes, runs `npm install` when package files changed, and restarts `moonbags` with `pm2`.
+Short aliases:
+
+| Shortcut | Meaning |
+| --- | --- |
+| `npm run up` | start dry-run under PM2 |
+| `npm run ps` | show PM2 status |
+| `npm run logs` | stream MoonBags logs |
+| `npm run tail` | print recent MoonBags logs |
+| `npm run re` | restart with updated env |
+| `npm run down` | stop the bot |
+| `npm run save` | save PM2 process list |
+
+Live trading is a separate owner decision and is not part of these PM2
+shortcuts. Once `pm2` is running, Telegram `/update` becomes the self-healing
+update path: it checks `origin/main`, shows incoming commits, refuses unsafe
+local changes, runs `npm install` when package files changed, and restarts
+`moonbags` with `pm2`.
 
 ### What the setup wizard asks for
 
@@ -290,7 +309,7 @@ Solana's public RPC is rate-limited. You need a private endpoint.
 
 ### 3. Jupiter API key
 
-Jupiter Ultra provides the swap routing. The free tier is sufficient.
+Jupiter Swap V2 Meta-Aggregator provides managed `/order` + `/execute` swap routing. The free tier is sufficient. MoonBags does not send referral fee parameters by default.
 
 1. Get a key at [developers.jup.ag/portal](https://developers.jup.ag/portal).
 2. Set in `.env`:
@@ -452,7 +471,7 @@ LLM_POLL_MS=30000              # how often the LLM advisor checks armed position
 OKX_WSS_ENABLED=false          # optional WSS acceleration for open positions only
 
 # === EXECUTION ===
-SLIPPAGE_BPS=2500              # fallback slippage for non-Ultra quotes
+SLIPPAGE_BPS=2500              # currently unused for Jupiter managed /order; RTSE handles slippage
 DRY_RUN=true                   # FALSE to enable real trades
 
 # === DASHBOARD ===
@@ -524,35 +543,26 @@ Use a process manager so the bot survives crashes:
 **Option A — `pm2`:**
 ```bash
 npm install -g pm2
-pm2 start "npm run start" --name moonbags
-pm2 logs moonbags
-pm2 save           # persist across reboot
-pm2 startup        # follow instructions to enable on boot
+npm run up
+npm run ps
+npm run logs
+npm run save               # persist across reboot
+npm run boot               # follow the printed sudo command to resurrect PM2 on boot
 ```
 
-**Option B — `systemd`** (Linux):
-Create `/etc/systemd/system/moonbags.service`:
-```ini
-[Unit]
-Description=MoonBags trading bot
-After=network.target
+Use systemd only through PM2 startup integration so it resurrects the PM2
+process manager. Do not create a separate MoonBags systemd service while PM2 is
+managing the bot, or you will have two active runners.
 
-[Service]
-Type=simple
-User=youruser
-WorkingDirectory=/path/to/moonbags
-ExecStart=/usr/bin/env npm run start
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
+**Option B — Docker (any OS):**
 ```bash
-sudo systemctl enable --now moonbags
-journalctl -u moonbags -f
+cp .env.example .env   # fill in your keys
+docker compose up -d   # builds, starts, auto-restarts on crash
+docker compose logs -f # watch logs
 ```
+
+Positions and settings are written to `./state/` on your host so they survive
+container restarts. The dashboard is available at `http://localhost:8787`.
 
 ### Verify it's running
 
@@ -849,10 +859,8 @@ Sells every open position immediately via Jupiter. Confirms with a summary messa
 ### Restarting the bot
 
 ```bash
-pm2 restart moonbags
-pm2 restart moonbags --update-env   # after .env or PATH changes
-# or
-sudo systemctl restart moonbags
+npm run pm2:restart                 # after .env or PATH changes
+npm run pm2:logs
 ```
 
 State is preserved. Positions in flight at the moment of restart are reconciled from your wallet balance and logged to `state/stranded.json`.
@@ -863,8 +871,8 @@ If the bot is running under `pm2`, `/update` can pull the latest `origin/main`, 
 
 ```bash
 npm install -g pm2
-pm2 start "npm run start" --name moonbags
-pm2 save
+npm run pm2:start:dry
+npm run pm2:save
 ```
 
 Then send `/update` in Telegram. The bot checks for `git`, refuses to update when the working tree has local edits or local-only commits, shows incoming commits, warns when positions are open, and requires a confirm tap before running `git pull --ff-only origin main`. If `package.json` or `package-lock.json` changed, it runs `npm install` before `pm2 restart moonbags --update-env`.
@@ -950,8 +958,8 @@ Fast checks:
 
 ```bash
 npm run doctor
-pm2 restart moonbags --update-env
-pm2 logs moonbags
+npm run pm2:restart
+npm run pm2:logs
 ```
 
 Telegram checks:
@@ -964,8 +972,8 @@ Telegram checks:
 Common fixes:
 
 - OnchainOS missing: `npm run install:onchainos`, then reopen terminal or add `~/.local/bin` to PATH.
-- Bot running under old env: `pm2 restart moonbags --update-env`.
-- Telegram quiet: send `/doctor`, then `/setup_status`, then check `pm2 logs moonbags`.
+- Bot running under old env: `npm run pm2:restart`.
+- Telegram quiet: send `/doctor`, then `/setup_status`, then check `npm run pm2:logs`.
 - No entry signals: send `/ping`. If it says the poller is alive but recent decisions are filtered, check `MAX_ALERT_AGE_MINS`, `MIN_LIQUIDITY_USD`, `MIN_SCORE`, and the other alert filters in `.env`. `0` disables each numeric filter. Also check `/mcapfilter` — if an mcap range is active, alerts outside it are silently dropped.
 - WSS off: this is normal unless you set `OKX_WSS_ENABLED=true`. WSS is only an acceleration layer for positions you already hold; Jupiter still confirms every exit.
 - Need latest version: send `/update` in Telegram after `pm2` is set up.
@@ -997,7 +1005,7 @@ src/
 ├── logger.ts            ← pino logger
 ├── scgPoller.ts         ← polls SCG Alpha + pause/blacklist state (persisted)
 ├── positionManager.ts   ← position lifecycle, tickPositions, tickLlmAdvisor
-├── jupClient.ts         ← Jupiter Ultra swap execution + wallet balance
+├── jupClient.ts         ← Jupiter Swap V2 managed execution + wallet balance
 ├── jupTokensClient.ts   ← Jupiter Tokens API enrichment (verification, organic score, audit)
 ├── priceFeed.ts         ← OKX prices (primary) + Jupiter sell quote (fallback)
 ├── okxClient.ts         ← onchainos CLI wrapper for the LLM data layer + dashboard kline
