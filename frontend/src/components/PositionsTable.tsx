@@ -23,10 +23,49 @@ type Props = {
 export function PositionsTable({ positions, tokenInfo = {}, kline1m = {}, loading }: Props) {
   // tick so the age/pnl stay fresh
   const [, force] = useState(0);
+  const [sellingMints, setSellingMints] = useState<Record<string, boolean>>({});
+  const [sellErrors, setSellErrors] = useState<Record<string, string>>({});
   useEffect(() => {
     const id = setInterval(() => force((n) => n + 1), 1000);
     return () => clearInterval(id);
   }, []);
+
+  useEffect(() => {
+    const next: Record<string, boolean> = {};
+    for (const position of positions) {
+      if (position.status === "closing") next[position.mint] = true;
+    }
+    setSellingMints(next);
+  }, [positions]);
+
+  async function handleManualSell(position: Position): Promise<void> {
+    if (position.status !== "open") return;
+    const confirmed = window.confirm(`Sell ${position.name} now? This triggers a manual Jupiter exit for the full position.`);
+    if (!confirmed) return;
+
+    setSellingMints((current) => ({ ...current, [position.mint]: true }));
+    setSellErrors((current) => {
+      const next = { ...current };
+      delete next[position.mint];
+      return next;
+    });
+
+    try {
+      const response = await fetch(`/api/positions/${encodeURIComponent(position.mint)}/sell`, { method: "POST" });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || payload?.ok === false) {
+        throw new Error(typeof payload?.reason === "string" ? payload.reason : `HTTP ${response.status}`);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setSellingMints((current) => {
+        const next = { ...current };
+        delete next[position.mint];
+        return next;
+      });
+      setSellErrors((current) => ({ ...current, [position.mint]: message }));
+    }
+  }
 
   if (loading) {
     return (
@@ -47,7 +86,15 @@ export function PositionsTable({ positions, tokenInfo = {}, kline1m = {}, loadin
   return (
     <div className="space-y-3">
       {positions.map((p) => (
-        <PositionCard key={p.mint} p={p} info={tokenInfo[p.mint]} kline={kline1m[p.mint] ?? []} />
+        <PositionCard
+          key={p.mint}
+          p={p}
+          info={tokenInfo[p.mint]}
+          kline={kline1m[p.mint] ?? []}
+          selling={Boolean(sellingMints[p.mint]) || p.status === "closing"}
+          sellError={sellErrors[p.mint]}
+          onManualSell={handleManualSell}
+        />
       ))}
     </div>
   );
@@ -85,7 +132,21 @@ const TONE_HOVER_BORDER: Record<Tone, string> = {
   bad: "hover:border-coral/30",
 };
 
-function PositionCard({ p, info, kline }: { p: Position; info?: TokenInfo; kline: number[] }) {
+function PositionCard({
+  p,
+  info,
+  kline,
+  selling,
+  sellError,
+  onManualSell,
+}: {
+  p: Position;
+  info?: TokenInfo;
+  kline: number[];
+  selling: boolean;
+  sellError?: string;
+  onManualSell: (position: Position) => Promise<void>;
+}) {
   const hasEntry = p.entryPricePerTokenSol > 0;
   const pnl = hasEntry
     ? (p.currentPricePerTokenSol - p.entryPricePerTokenSol) / p.entryPricePerTokenSol
@@ -108,6 +169,17 @@ function PositionCard({ p, info, kline }: { p: Position; info?: TokenInfo; kline
   // Real 1m closes from OKX (last ~60 min), oldest first. Empty if backend
   // hasn't fetched yet or token has no liquidity.
   const haveKline = kline.length >= 2;
+  const canSell = p.status === "open" && !selling;
+  const sellLabel = selling ? "SELLING..." : p.status === "opening" ? "OPENING" : p.status === "closing" ? "SELLING..." : "SELL NOW";
+  const statusText = sellError
+    ? sellError
+    : selling
+      ? "Manual exit in flight"
+      : canSell
+        ? "Uses bot close path"
+        : p.status === "opening"
+          ? "Wait for position to open"
+          : "Not available";
 
   return (
     <div
@@ -224,20 +296,25 @@ function PositionCard({ p, info, kline }: { p: Position; info?: TokenInfo; kline
         </div>
 
         <div className="flex items-center justify-between gap-3 md:w-[152px] md:flex-col md:items-stretch md:justify-center shrink-0">
-          <div className="rounded-sm border border-outline-variant/20 bg-surface-container-high/40 px-3 py-2">
+          <button
+            type="button"
+            disabled={!canSell}
+            onClick={() => void onManualSell(p)}
+            className="rounded-sm border border-coral/30 bg-coral/10 px-3 py-2 text-left transition-colors hover:border-coral/60 hover:bg-coral/20 disabled:cursor-not-allowed disabled:border-outline-variant/20 disabled:bg-surface-container-high/40"
+          >
             <div className="font-mono text-[9px] uppercase tracking-widest text-muted-foreground">
               Manual Exit
             </div>
-            <div className="font-mono text-[11px] font-bold uppercase tracking-wide text-foreground">
-              Unavailable
+            <div className="font-mono text-[11px] font-bold uppercase tracking-wide text-coral">
+              {sellLabel}
             </div>
-          </div>
+          </button>
           <div className="rounded-sm border border-pepe/20 bg-pepe/10 px-3 py-2 text-right md:text-left">
             <div className="font-mono text-[9px] uppercase tracking-widest text-muted-foreground">
               Position
             </div>
-            <div className="font-mono text-[11px] font-bold uppercase tracking-wide text-pepe">
-              Bot managed
+            <div className={`font-mono text-[11px] font-bold uppercase tracking-wide ${sellError ? "text-coral" : selling ? "text-earth" : "text-pepe"}`}>
+              {statusText}
             </div>
           </div>
         </div>

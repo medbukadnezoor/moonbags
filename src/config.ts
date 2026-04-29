@@ -130,6 +130,7 @@ export const CONFIG = ({
   LLM_ENTRY_ENABLED: bool("LLM_ENTRY_ENABLED", false),
   LLM_EXIT_IMMEDIATE: bool("LLM_EXIT_IMMEDIATE", false),
   LLM_POLL_MS: num("LLM_POLL_MS", 30_000),
+  LLM_HEARTBEAT_MINS: num("LLM_HEARTBEAT_MINS", 15),
   OKX_WSS_ENABLED: bool("OKX_WSS_ENABLED", false),
   // LLM provider — defaults to MiniMax for backwards compat.
   // Set LLM_API_KEY + LLM_ENDPOINT + LLM_MODEL to use any OpenAI-compatible
@@ -172,7 +173,8 @@ export type SettableKey =
   | "MOONBAG_PCT"
   | "MB_TRAIL_PCT"
   | "MB_TIMEOUT_SECS"
-  | "LLM_POLL_MS";
+  | "LLM_POLL_MS"
+  | "LLM_HEARTBEAT_MINS";
 
 export type SettableValue = number | boolean | number[];
 
@@ -297,6 +299,19 @@ export const SETTABLE_SPECS: Record<SettableKey, Spec> = {
       return `${Math.round(n / 1000)}s`;
     },
   },
+  LLM_HEARTBEAT_MINS: {
+    type: "number",
+    validate: (v) =>
+      typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= 1440
+        ? null
+        : "must be 0 – 1440 minutes (0 = off)",
+    display: (v) => {
+      const n = v as number;
+      if (n === 0) return "off";
+      if (n >= 60) return `${(n / 60).toFixed(n % 60 === 0 ? 0 : 1)}h`;
+      return `${Math.round(n)}m`;
+    },
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -305,7 +320,7 @@ export const SETTABLE_SPECS: Record<SettableKey, Spec> = {
 // state/runtimeFlags.json on every change and reloaded at startup.
 // ---------------------------------------------------------------------------
 const RUNTIME_FLAGS_PATH = path.resolve("state/runtimeFlags.json");
-const PERSISTED_FLAGS = new Set<SettableKey>(["LLM_EXIT_ENABLED", "LLM_ENTRY_ENABLED", "LLM_EXIT_IMMEDIATE"]);
+const PERSISTED_FLAGS = new Set<SettableKey>(["LLM_EXIT_ENABLED", "LLM_ENTRY_ENABLED", "LLM_EXIT_IMMEDIATE", "LLM_HEARTBEAT_MINS"]);
 
 function loadRuntimeFlags(): void {
   try {

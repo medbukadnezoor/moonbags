@@ -255,28 +255,28 @@ const DEFAULT_SETTINGS: GmgnSettings = {
   filters: {
     minMarketCapUsd: 0,
     maxMarketCapUsd: 0,
-    minLiquidityUsd: 10_000,
-    minHolders: 150,
+    minLiquidityUsd: 2_500,
+    minHolders: 50,
     minTokenAgeMins: 0,
     maxTokenAgeMins: 240,
     minSmartMoneyCount: 0,
     minKolCount: 0,
     maxRugRatio: 0.35,
-    maxTop10Pct: 45,
+    maxTop10Pct: 65,
     requireNoHoneypot: true,
     requireRenounced: false,
     requirePool: false,
-    maxBundlerPct: 40,
-    maxBotPct: 45,
-    maxCreatorBalancePct: 20,
-    requireNotWashTrading: true,
+    maxBundlerPct: 80,
+    maxBotPct: 80,
+    maxCreatorBalancePct: 40,
+    requireNotWashTrading: false,
   },
   trigger: {
-    minScans: 10,
-    minHolderGrowthPct: 7,
-    maxHolderGrowthPct: 50,
-    maxLiquidityDropPct: 30,
-    minBuySellRatio: 1.15,
+    minScans: 1,
+    minHolderGrowthPct: 0,
+    maxHolderGrowthPct: 0,
+    maxLiquidityDropPct: 80,
+    minBuySellRatio: 0,
     minSmartOrKolCount: 0,
   },
   mintCooldownMins: 90,
@@ -1387,15 +1387,22 @@ async function deepDiveCandidate(seed: GmgnSignalCandidate): Promise<DeepDiveRes
   next.alert.score = next.score;
   next.alert.sourceMeta = next.sourceMeta;
 
-  // Jup audit gate — enforce fees + organicScoreLabel when Jupiter has data.
-  // When audit is null (token not indexed — too new/small), pass through and
-  // rely on GMGN-native signals. This lets new micro-caps through while still
-  // catching indexed tokens with zero organic score (e.g. bot-coordinated pumps).
+  // Jup audit gate — OKX keeps the strict global gate, but GMGN is intentionally
+  // looser. Telegram operators reported GMGN was effectively "filtering
+  // everything out"; local watchlist evidence agreed, with most mature GMGN
+  // candidates dying on fees < 1 despite passing GMGN-native momentum. For GMGN
+  // candidates, keep the audit attached for operator visibility but do not
+  // reject on Jupiter fees/score. The GMGN baseline + trigger checks above still
+  // guard liquidity, holders, bundlers/bots, mcap, scans, and momentum.
   const jupCfg = getRuntimeSettings().jupGate;
   const audit = await fetchJupAudit(seed.mint);
-  const effectiveCfg: JupGateConfig = audit == null
-    ? { ...jupCfg, minFees: 0, allowedScoreLabels: [] }
-    : jupCfg;
+  const effectiveCfg: JupGateConfig = {
+    ...jupCfg,
+    minFees: 0,
+    allowedScoreLabels: [],
+    minOrganicVolumePct: 0,
+    minOrganicBuyersPct: 0,
+  };
   const gate = passesJupGate(audit, effectiveCfg);
   if (!gate.ok) {
     return { ok: false, reason: gate.reason };

@@ -292,3 +292,34 @@ export function notifyMilestone(args: {
     },
   );
 }
+
+export function notifyLlmHeartbeat(items: Array<{
+  name: string;
+  mint: string;
+  pnlPct: number;
+  peakPnlPct: number;
+  trailPct: number;
+  floorPnlPct: number;
+  heldMs: number;
+  lastCheckedMs: number | null;
+  decisionCount: number;
+  lastAction: string;
+  lastReason: string;
+  lastDecisionMs: number | null;
+}>): Promise<void> {
+  if (items.length === 0) return Promise.resolve();
+  const lines = items.slice(0, 10).map((item) => {
+    const sign = item.pnlPct >= 0 ? "+" : "";
+    const checked = item.lastCheckedMs == null ? "never" : holdFmt(Math.floor(item.lastCheckedMs / 1000));
+    const decided = item.lastDecisionMs == null ? "never" : holdFmt(Math.floor(item.lastDecisionMs / 1000));
+    return (
+      `• <b>${escapeHtml(item.name)}</b> ${sign}${item.pnlPct.toFixed(1)}% ` +
+      `(peak +${item.peakPnlPct.toFixed(1)}%, floor +${item.floorPnlPct.toFixed(1)}%)\n` +
+      `  trail ${(item.trailPct * 100).toFixed(0)}% · held ${holdFmt(Math.floor(item.heldMs / 1000))} · checked ${checked} ago\n` +
+      `  decisions ${item.decisionCount} · last ${escapeHtml(item.lastAction)} ${decided} ago · <i>${escapeHtml(item.lastReason)}</i>\n` +
+      `  <a href="${gmgn(escapeHtml(item.mint))}">GMGN</a>`
+    );
+  });
+  const more = items.length > 10 ? `\n…and ${items.length - 10} more.` : "";
+  return send(`🤖 <b>LLM heartbeat</b>\n\n${lines.join("\n")}${more}`);
+}

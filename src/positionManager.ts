@@ -5,7 +5,7 @@ import { CONFIG, SOL_MINT } from "./config.js";
 import logger from "./logger.js";
 import { buyTokenWithSol, sellTokenForSol, getWalletTokenBalance, unwrapResidualWsol } from "./jupClient.js";
 import { getBatchPricesParallel, getPriceViaSellQuote } from "./priceFeed.js";
-import { notifyBuy, notifyBuyFail, notifySell, notifySellFail, notifyArmed, notifyMoonbagStart, notifyLlmActive, notifyLlmTighten, notifyLlmPartial, notifyTakeProfitPartial, notifyMilestone } from "./notifier.js";
+import { notifyBuy, notifyBuyFail, notifySell, notifySellFail, notifyArmed, notifyMoonbagStart, notifyLlmActive, notifyLlmTighten, notifyLlmPartial, notifyTakeProfitPartial, notifyMilestone, notifyLlmHeartbeat } from "./notifier.js";
 import { consultLlm, type LlmContext } from "./llmExitAdvisor.js";
 import { getPositionSnapshot } from "./okxClient.js";
 import { getOkxWsOverlay, unwatchOkxWsMint, watchOkxWsMint } from "./okxWsService.js";
@@ -37,6 +37,8 @@ let persistTimer: NodeJS.Timeout | null = null;
 export type ClosedTrade = {
   mint: string;
   name: string;
+  dryRun: boolean;
+  tradingMode: "dry_run" | "live";
   closedAt: number;
   openedAt: number;
   holdSecs: number;
@@ -779,6 +781,11 @@ async function tickOne(
 const MAX_SELL_RETRIES = 10;
 const SELL_RETRY_COOLDOWN_MS = 60_000;
 
+async function getSellableTokenBalance(position: Position): Promise<bigint | null> {
+  if (CONFIG.DRY_RUN) return position.tokensHeld;
+  return getWalletTokenBalance(position.mint);
+}
+
 function findTriggeredTpTarget(
   position: Position,
   targets: TpTarget[],
@@ -813,7 +820,7 @@ async function partialSellForTakeProfit(
   position.lastSellAttemptAt = Date.now();
   markDirty();
 
-  const walletBalance = await getWalletTokenBalance(mint);
+  const walletBalance = await getSellableTokenBalance(position);
   if (walletBalance === 0n) {
     position.status = "closed";
     position.exitReason = "manual";
@@ -897,7 +904,7 @@ async function partialSellAndMoonbag(position: Position, reason: "trail" | "take
   position.lastSellAttemptAt = Date.now();
   markDirty();
 
-  const walletBalance = await getWalletTokenBalance(mint);
+  const walletBalance = await getSellableTokenBalance(position);
   if (walletBalance === 0n) {
     position.status = "closed";
     position.exitReason = "manual";
@@ -1016,7 +1023,7 @@ async function partialSellPosition(
   position.lastSellAttemptAt = Date.now();
   markDirty();
 
-  const walletBalance = await getWalletTokenBalance(mint);
+  const walletBalance = await getSellableTokenBalance(position);
   if (walletBalance === 0n) {
     // Position tokens no longer present — treat as fully closed (manual sell).
     position.status = "closed";
@@ -1117,8 +1124,8 @@ async function closePosition(mint: string, reason: CloseReason): Promise<void> {
   position.lastSellAttemptAt = Date.now();
   markDirty();
 
-  const walletBalance = await getWalletTokenBalance(mint);
-  if (walletBalance === 0n) {
+  const walletBalance = await getSellableTokenBalance(position);
+  if (!CONFIG.DRY_RUN && walletBalance === 0n) {
     position.status = "closed";
     position.exitReason = "manual";
     markDirty();
@@ -1188,6 +1195,8 @@ async function closePosition(mint: string, reason: CloseReason): Promise<void> {
   );
   void appendClosedTrade({
     mint, name: position.name,
+    dryRun: CONFIG.DRY_RUN,
+    tradingMode: CONFIG.DRY_RUN ? "dry_run" : "live",
     closedAt: Date.now(), openedAt: position.openedAt, holdSecs: holdSecsLog,
     entrySol: cumulativeEntrySol,
     exitSol: cumulativeExitSol,
@@ -1284,6 +1293,48 @@ export async function tickLlmAdvisor(): Promise<void> {
   })));
 }
 
+export async function tickLlmHeartbeat(): Promise<void> {
+  if (!CONFIG.LLM_EXIT_ENABLED || CONFIG.LLM_HEARTBEAT_MINS === 0) return;
+  const heartbeatMs = CONFIG.LLM_HEARTBEAT_MINS * 60_000;
+  const now = Date.now();
+  const due = Array.from(positions.values()).filter((p) =>
+    p.status === "open" &&
+    p.llmActiveNotified &&
+    p.llmWatchStartedAt &&
+    (!p.lastLlmHeartbeatAt || now - p.lastLlmHeartbeatAt >= heartbeatMs),
+  );
+  if (due.length === 0) return;
+
+  for (const p of due) {
+    p.lastLlmHeartbeatAt = now;
+  }
+  markDirty();
+
+  void notifyLlmHeartbeat(due.map((p) => {
+    const entry = p.entryPricePerTokenSol;
+    const current = p.currentPricePerTokenSol;
+    const peak = p.peakPricePerTokenSol;
+    const pnlPct = entry > 0 ? (current / entry - 1) * 100 : 0;
+    const peakPnlPct = entry > 0 ? (peak / entry - 1) * 100 : 0;
+    const trailPct = p.dynamicTrailPct ?? CONFIG.TRAIL_PCT;
+    const floorPnlPct = peakPnlPct - trailPct * 100;
+    return {
+      name: p.name,
+      mint: p.mint,
+      pnlPct,
+      peakPnlPct,
+      trailPct,
+      floorPnlPct,
+      heldMs: now - p.openedAt,
+      lastCheckedMs: p.lastLlmCheckAt ? now - p.lastLlmCheckAt : null,
+      decisionCount: p.llmDecisionCount ?? 0,
+      lastAction: p.lastLlmAction ?? "hold",
+      lastReason: p.lastLlmReason ?? "no decision yet",
+      lastDecisionMs: p.lastLlmDecisionAt ? now - p.lastLlmDecisionAt : null,
+    };
+  }));
+}
+
 async function consultOnePosition(position: Position): Promise<void> {
   position.lastLlmCheckAt = Date.now();
 
@@ -1295,6 +1346,7 @@ async function consultOnePosition(position: Position): Promise<void> {
   // One-time "LLM watching" notification when LLM first picks up an armed position.
   if (!position.llmActiveNotified) {
     position.llmActiveNotified = true;
+    position.llmWatchStartedAt = Date.now();
     markDirty();
     void notifyLlmActive({
       name: position.name,
@@ -1355,6 +1407,11 @@ async function consultOnePosition(position: Position): Promise<void> {
 
   if (decision.action === "hold") {
     logger.debug({ mint: position.mint, reason: decision.reason }, "[llm] hold");
+    position.lastLlmAction = "hold";
+    position.lastLlmReason = decision.reason;
+    position.lastLlmDecisionAt = Date.now();
+    position.llmDecisionCount = (position.llmDecisionCount ?? 0) + 1;
+    markDirty();
     return;
   }
 
@@ -1367,7 +1424,10 @@ async function consultOnePosition(position: Position): Promise<void> {
     }
     const direction = decision.newTrailPct < oldTrail ? "tightened" : "loosened";
     position.dynamicTrailPct = decision.newTrailPct;
+    position.lastLlmAction = "set_trail";
     position.lastLlmReason = decision.reason;
+    position.lastLlmDecisionAt = Date.now();
+    position.llmDecisionCount = (position.llmDecisionCount ?? 0) + 1;
     markDirty();
     logger.info(
       { mint: position.mint, oldTrail, newTrail: decision.newTrailPct, direction, reason: decision.reason },
@@ -1388,7 +1448,10 @@ async function consultOnePosition(position: Position): Promise<void> {
 
   if (decision.action === "exit_now") {
     logger.info({ mint: position.mint, reason: decision.reason }, "[llm] exit triggered");
+    position.lastLlmAction = "exit_now";
     position.lastLlmReason = decision.reason;
+    position.lastLlmDecisionAt = Date.now();
+    position.llmDecisionCount = (position.llmDecisionCount ?? 0) + 1;
     markDirty();
     await closePosition(position.mint, "llm");
     return;
@@ -1406,6 +1469,11 @@ async function consultOnePosition(position: Position): Promise<void> {
       logger.warn({ mint: position.mint, priorPartials }, "[llm] partial_exit cap reached (5), ignoring");
       return;
     }
+    position.lastLlmAction = "partial_exit";
+    position.lastLlmReason = decision.reason;
+    position.lastLlmDecisionAt = Date.now();
+    position.llmDecisionCount = (position.llmDecisionCount ?? 0) + 1;
+    markDirty();
     await partialSellPosition(position, decision.sellPct, decision.reason);
   }
 }

@@ -3,7 +3,7 @@ module.exports = {
     {
       name: "moonbags",
       script: "npm",
-      args: "run start:dry",
+      args: "run start",
       cwd: __dirname,
       watch: false,
       autorestart: true,
@@ -11,7 +11,7 @@ module.exports = {
       max_restarts: 10,
       env: {
         NODE_ENV: "production",
-        DRY_RUN: "true",
+        DRY_RUN: "false",
       },
       out_file: "logs/pm2-out.log",
       error_file: "logs/pm2-error.log",
