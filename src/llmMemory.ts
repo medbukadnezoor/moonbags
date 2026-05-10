@@ -14,6 +14,7 @@
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import path from "node:path";
 import type { PositionSnapshot } from "./okxClient.js";
+import logger from "./logger.js";
 
 // ---------------------------------------------------------------------------
 // L2 — in-memory ring buffers
@@ -237,8 +238,10 @@ export async function appendLlmTradeRecord(rec: LlmTradeRecord): Promise<void> {
       try {
         const raw = await readFile(DECISIONS_FILE, "utf8");
         all = JSON.parse(raw) as LlmTradeRecord[];
-      } catch {
-        /* first write */
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+          logger.warn({ err: String(err) }, "[llm-memory] trade record read failed, starting fresh");
+        }
       }
       all.push(rec);
       if (all.length > MAX_RECORDS) all = all.slice(-MAX_RECORDS);
@@ -257,7 +260,10 @@ export async function readLlmTradeRecords(limit = 100): Promise<LlmTradeRecord[]
     const raw = await readFile(DECISIONS_FILE, "utf8");
     const all = JSON.parse(raw) as LlmTradeRecord[];
     return all.slice(-limit).reverse();
-  } catch {
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      logger.warn({ err: String(err) }, "[llm-memory] readLlmTradeRecords failed");
+    }
     return [];
   }
 }
@@ -292,8 +298,10 @@ export async function appendLlmPromptAudit(rec: LlmPromptAuditRecord): Promise<v
       try {
         const raw = await readFile(file, "utf8");
         all = JSON.parse(raw) as LlmPromptAuditRecord[];
-      } catch {
-        /* first write */
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+          logger.warn({ err: String(err) }, "[llm-memory] prompt audit read failed, starting fresh");
+        }
       }
       all.push(rec);
       if (all.length > MAX_AUDIT_RECORDS_PER_MINT) {
