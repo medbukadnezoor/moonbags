@@ -118,7 +118,8 @@ export async function scanEmptyTokenAccounts(): Promise<ReclaimScan> {
       empty: empty.length,
       estimatedLamports: empty.reduce((s, { lamports }) => s + lamports, 0),
     };
-  } catch {
+  } catch (err) {
+    logger.warn({ err: String(err) }, "[reclaim] scanEmptyTokenAccounts failed — RPC may be down");
     return { empty: 0, estimatedLamports: 0 };
   }
 }
@@ -237,7 +238,8 @@ export function getWalletAddress(): string | null {
   try {
     const kp = Keypair.fromSecretKey(bs58.decode(CONFIG.PRIV_B58));
     return kp.publicKey.toBase58();
-  } catch {
+  } catch (err) {
+    logger.warn({ err: String(err) }, "[wallet] getWalletAddress failed — PRIV_B58 may be corrupt or missing");
     return null;
   }
 }
@@ -279,11 +281,12 @@ export async function getTokenDecimals(mint: string): Promise<number> {
       }
     }
     logger.warn({ mint }, "getTokenDecimals: unparsed account, defaulting to 6");
+    decimalsCache.set(mint, 6);
+    return 6;
   } catch (err) {
-    logger.warn({ mint, err: (err as Error).message }, "getTokenDecimals: RPC failed, defaulting to 6");
+    logger.warn({ mint, err: (err as Error).message }, "getTokenDecimals: RPC failed, defaulting to 6 (not cached — will retry next access)");
+    return 6;
   }
-  decimalsCache.set(mint, 6);
-  return 6;
 }
 
 async function getOrderQuote(params: GetOrderParams): Promise<JupOrderResponse> {
@@ -386,6 +389,9 @@ export async function quoteTokenToSol(
 const BUY_MAX_ATTEMPTS = 20;
 const BUY_RETRY_MS = 1000;
 
+const SELL_MAX_ATTEMPTS = 3;
+const SELL_RETRY_MS = 500;
+
 async function buyOnce(
   mint: string,
   solLamports: bigint,
@@ -456,8 +462,9 @@ export async function sellTokenForSol(
   mint: string,
   tokenAmountRaw: bigint,
 ): Promise<{ signature: string; solReceivedLamports: bigint } | null> {
-  try {
-    if (CONFIG.DRY_RUN) {
+  // DRY_RUN path — no retries needed
+  if (CONFIG.DRY_RUN) {
+    try {
       const order = await getOrderQuote({
         inputMint: mint,
         outputMint: SOL_MINT,
@@ -471,29 +478,48 @@ export async function sellTokenForSol(
         signature: `DRY_RUN_SELL_${mint.slice(0, 8)}`,
         solReceivedLamports: BigInt(order.outAmount),
       };
-    }
-
-    const keypair = Keypair.fromSecretKey(bs58.decode(CONFIG.PRIV_B58));
-    const order = await getOrder({
-      inputMint: mint,
-      outputMint: SOL_MINT,
-      amountRaw: tokenAmountRaw,
-      taker: keypair.publicKey.toBase58(),
-    });
-    const tx = VersionedTransaction.deserialize(Buffer.from(order.transaction, "base64"));
-    tx.sign([keypair]);
-    const signedB64 = Buffer.from(tx.serialize()).toString("base64");
-    const exec = await executeOrder(order.requestId, signedB64);
-    if (exec.status !== "Success") {
-      logger.error({ mint, exec }, "sellTokenForSol execute non-success");
+    } catch (err) {
+      logger.error({ mint, err: (err as Error).message }, "sellTokenForSol [DRY_RUN] failed");
       return null;
     }
-    return {
-      signature: exec.signature ?? "",
-      solReceivedLamports: executedOutputAmountRaw(exec, order.outAmount),
-    };
-  } catch (err) {
-    logger.error({ mint, err: (err as Error).message }, "sellTokenForSol failed");
-    return null;
   }
+
+  // Live path — up to SELL_MAX_ATTEMPTS attempts
+  let lastError = "unknown error";
+  for (let attempt = 1; attempt <= SELL_MAX_ATTEMPTS; attempt++) {
+    try {
+      const keypair = Keypair.fromSecretKey(bs58.decode(CONFIG.PRIV_B58));
+      const order = await getOrder({
+        inputMint: mint,
+        outputMint: SOL_MINT,
+        amountRaw: tokenAmountRaw,
+        taker: keypair.publicKey.toBase58(),
+      });
+      const tx = VersionedTransaction.deserialize(Buffer.from(order.transaction, "base64"));
+      tx.sign([keypair]);
+      const signedB64 = Buffer.from(tx.serialize()).toString("base64");
+      const exec = await executeOrder(order.requestId, signedB64);
+      if (exec.status !== "Success") {
+        lastError = `execute non-success: ${JSON.stringify(exec).slice(0, 100)}`;
+        logger.warn({ mint, attempt, exec }, "sellTokenForSol execute non-success, retrying");
+        if (attempt < SELL_MAX_ATTEMPTS) {
+          await new Promise((r) => setTimeout(r, SELL_RETRY_MS));
+        }
+        continue;
+      }
+      if (attempt > 1) logger.info({ mint, attempt }, "sellTokenForSol succeeded after retries");
+      return {
+        signature: exec.signature ?? "",
+        solReceivedLamports: executedOutputAmountRaw(exec, order.outAmount),
+      };
+    } catch (err) {
+      lastError = (err as Error).message;
+      logger.warn({ mint, attempt, maxAttempts: SELL_MAX_ATTEMPTS, err: lastError }, "sellTokenForSol attempt failed, retrying");
+      if (attempt < SELL_MAX_ATTEMPTS) {
+        await new Promise((r) => setTimeout(r, SELL_RETRY_MS));
+      }
+    }
+  }
+  logger.error({ mint, attempts: SELL_MAX_ATTEMPTS, err: lastError }, "sellTokenForSol failed permanently after all retries");
+  return null;
 }

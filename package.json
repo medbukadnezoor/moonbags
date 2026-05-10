@@ -31,7 +31,13 @@
     "tail": "npm run pm2:tail",
     "save": "npm run pm2:save",
     "boot": "npm run pm2:startup",
-    "del": "npm run pm2:delete"
+    "del": "npm run pm2:delete",
+    "harvest:discover": "npm run --prefix tools/wallet-harvester harvest:discover",
+    "harvest:run:gmgn": "npm run --prefix tools/wallet-harvester harvest:run:gmgn",
+    "harvest:status": "npm run --prefix tools/wallet-harvester harvest:status",
+    "harvest:export:wallets": "npm run --prefix tools/wallet-harvester harvest:export:wallets",
+    "harvest:export:seed-list": "npm run --prefix tools/wallet-harvester harvest:export:seed-list",
+    "harvest:hypotheses": "npm run --prefix tools/wallet-harvester harvest:hypotheses"
   },
   "dependencies": {
     "@solana/web3.js": "^1.95.0",

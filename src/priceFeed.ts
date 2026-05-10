@@ -73,6 +73,7 @@ export async function getPricesV3(
         signal: AbortSignal.timeout(3_000),
       });
       if (!res.ok) {
+        logger.warn({ status: res.status, mintCount: chunk.length }, "[price-feed] batch price fetch non-OK — mints will get null prices (API down or not listed)");
         for (const m of chunk) out.set(m, null);
         continue;
       }

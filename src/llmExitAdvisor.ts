@@ -931,7 +931,7 @@ function lessonForVerdict(verdict: string): string {
 }
 
 async function buildSimilarCases(evidence: EvidencePacket): Promise<SimilarCaseSummary | null> {
-  const active = evidence.gate.activeBearishKeys;
+  const active = [...evidence.gate.activeBearishKeys, ...evidence.gate.activeProactiveKeys];
   if (active.length === 0) return null;
   const records = await readLlmTradeRecords(200).catch(() => []);
   if (records.length === 0) return null;
@@ -1145,7 +1145,7 @@ function applyEvidenceGate(
 
   if (decision.action === "partial_exit" && !gate.partialExitAllowed) {
     logger.warn(
-      { mint: ctx.mint, activeFacts: active, requested: decision.action },
+      { mint: ctx.mint, activeFacts: active, requested: decision.action, pnlPct: ctx.pnlPct, peakPnlPct: ctx.peakPnlPct },
       "[llm] partial_exit blocked by evidence gate",
     );
     return blockDecision(
@@ -1158,7 +1158,7 @@ function applyEvidenceGate(
 
   if (decision.action === "exit_now" && !gate.exitNowAllowed) {
     logger.warn(
-      { mint: ctx.mint, activeFacts: active, requested: decision.action },
+      { mint: ctx.mint, activeFacts: active, requested: decision.action, pnlPct: ctx.pnlPct, peakPnlPct: ctx.peakPnlPct },
       "[llm] exit_now blocked by evidence gate",
     );
     return blockDecision(
@@ -1176,7 +1176,7 @@ function applyEvidenceGate(
     !gate.tightenAllowed
   ) {
     logger.warn(
-      { mint: ctx.mint, activeFacts: active, requested: decision.action },
+      { mint: ctx.mint, activeFacts: active, requested: decision.action, pnlPct: ctx.pnlPct, peakPnlPct: ctx.peakPnlPct },
       "[llm] tightening blocked by evidence gate",
     );
     return blockDecision(
@@ -1354,6 +1354,7 @@ export async function consultLlm(
         mint: ctx.mint,
         name: ctx.name,
         action: decision.action,
+        reason: decision.reason,
         newTrailPct: decision.newTrailPct,
         latencyMs: Date.now() - start,
       },

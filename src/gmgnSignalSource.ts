@@ -503,9 +503,12 @@ function getChainFromRow(row: GmgnRow, fallback: GmgnChain): GmgnChain {
   return fallback;
 }
 
-function maybeRatioPct(value: unknown): number {
+function maybeRatioPct(value: unknown, fieldName?: string): number {
   const n = parseNumber(value);
-  if (n <= 1 && n >= 0) return n * 100;
+  if (n > 0 && n <= 1) {
+    logger.warn({ field: fieldName, rawValue: n }, "[gmgn] maybeRatioPct: value in (0,1] converted to percentage — verify GMGN API convention");
+    return n * 100;
+  }
   return n;
 }
 
@@ -990,15 +993,16 @@ function baseSeedFromRow(source: GmgnSourceKind, chain: GmgnChain, row: GmgnRow)
   const smartMoneyCount = source === "signal" ? Math.max(1, smartMoneyCountRaw) : smartMoneyCountRaw;
   const kolCount = Math.round(parseNumber(getStringField(row, ["renowned_count", "kol_count", "kolCount"]) ?? row.renowned_count ?? 0));
   const sniperCount = Math.round(parseNumber(getStringField(row, ["sniper_count", "sniperCount"]) ?? row.sniper_count ?? 0));
-  const bundlerPct = maybeRatioPct(getStringField(row, ["bundler_rate", "bundler_pct", "bundlerPct", "bundler_percent"]) ?? row.bundler_rate ?? 0);
-  const ratTraderPct = maybeRatioPct(getStringField(row, ["rat_trader_amount_rate", "ratTraderPct", "rat_trader_rate"]) ?? row.rat_trader_amount_rate ?? 0);
+  const bundlerPct = maybeRatioPct(getStringField(row, ["bundler_rate", "bundler_pct", "bundlerPct", "bundler_percent"]) ?? row.bundler_rate ?? 0, "bundlerPct");
+  const ratTraderPct = maybeRatioPct(getStringField(row, ["rat_trader_amount_rate", "ratTraderPct", "rat_trader_rate"]) ?? row.rat_trader_amount_rate ?? 0, "ratTraderPct");
   const creatorBalancePct = maybeRatioPct(
     getStringField(row, ["creator_balance_rate", "creatorBalanceRate", "dev_balance_rate", "devHoldRate"]) ??
       row.creator_balance_rate ??
       row.dev_balance_rate ??
       0,
+    "creatorBalancePct",
   );
-  const top10Pct = maybeRatioPct(getStringField(row, ["top10_holder_rate", "top10Pct", "top_10_holder_rate"]) ?? row.top10_holder_rate ?? 0);
+  const top10Pct = maybeRatioPct(getStringField(row, ["top10_holder_rate", "top10Pct", "top_10_holder_rate"]) ?? row.top10_holder_rate ?? 0, "top10Pct");
   const rugRatio = parseNumber(getStringField(row, ["rug_ratio", "rugRatio"]) ?? row.rug_ratio ?? 0);
   const hotLevel = parseNumber(getStringField(row, ["hot_level", "hotLevel"]) ?? row.hot_level ?? 0);
   const change1m = parseNumber(getStringField(row, ["change1m", "price_change_1m", "price_change_percent1m", "priceChange1m"]) ?? row.change1m ?? 0);
@@ -1085,12 +1089,12 @@ async function enrichSeed(seed: GmgnSignalCandidate): Promise<GmgnSignalCandidat
 
     // GMGN nests rates under info.stat.*
     const stat = (infoObj.stat ?? {}) as Record<string, unknown>;
-    next.top10Pct = Math.max(next.top10Pct, maybeRatioPct(parseNumber(stat.top_10_holder_rate) || next.top10Pct));
-    next.bundlerPct = Math.max(next.bundlerPct, maybeRatioPct(parseNumber(stat.top_bundler_trader_percentage ?? stat.bot_degen_rate)));
-    next.ratTraderPct = Math.max(next.ratTraderPct, maybeRatioPct(parseNumber(stat.top_rat_trader_percentage)));
+    next.top10Pct = Math.max(next.top10Pct, maybeRatioPct(parseNumber(stat.top_10_holder_rate) || next.top10Pct, "top10Pct"));
+    next.bundlerPct = Math.max(next.bundlerPct, maybeRatioPct(parseNumber(stat.top_bundler_trader_percentage ?? stat.bot_degen_rate), "bundlerPct"));
+    next.ratTraderPct = Math.max(next.ratTraderPct, maybeRatioPct(parseNumber(stat.top_rat_trader_percentage), "ratTraderPct"));
     next.creatorBalancePct = Math.max(
       next.creatorBalancePct,
-      maybeRatioPct(parseNumber(stat.creator_hold_rate ?? stat.dev_team_hold_rate)),
+      maybeRatioPct(parseNumber(stat.creator_hold_rate ?? stat.dev_team_hold_rate), "creatorBalancePct"),
     );
 
     next.sourceMeta = {
@@ -1108,7 +1112,7 @@ async function enrichSeed(seed: GmgnSignalCandidate): Promise<GmgnSignalCandidat
     next.renouncedFreeze =
       getMaybeBool(securityObj.renounced_freeze_account) ?? getMaybeBool(securityObj.freeze_renounced) ?? next.renouncedFreeze;
     // top_10_holder_rate also appears on the security endpoint — use whichever is larger.
-    next.top10Pct = Math.max(next.top10Pct, maybeRatioPct(parseNumber(securityObj.top_10_holder_rate ?? securityObj.top10_holder_rate)));
+    next.top10Pct = Math.max(next.top10Pct, maybeRatioPct(parseNumber(securityObj.top_10_holder_rate ?? securityObj.top10_holder_rate), "top10Pct"));
     // NOTE: GMGN's open API does not expose `rug_ratio`, `is_wash_trading`, or a
     // direct `creator_balance_rate` on the security endpoint. `rugRatio` and
     // `isWashTrading` filters below are effectively always-pass and are
@@ -1253,9 +1257,9 @@ async function fetchSeeds(settings: GmgnSettings): Promise<GmgnSignalCandidate[]
             top10Pct: entry.top10Pct,
             rugRatio: entry.rugRatio,
             hotLevel: Math.max(0, Number(meta.hotLevel ?? 0) || 0),
-            change1m: Math.max(0, Number(meta.change1m ?? 0) || 0),
-            change5m: Math.max(0, Number(meta.change5m ?? 0) || 0),
-            change1h: Math.max(0, Number(meta.change1h ?? 0) || 0),
+            change1m: Number(meta.change1m ?? 0) || 0,
+            change5m: Number(meta.change5m ?? 0) || 0,
+            change1h: Number(meta.change1h ?? 0) || 0,
             isHoneypot: Boolean(meta.isHoneypot ?? false),
             isWashTrading: Boolean(meta.isWashTrading ?? false),
             renouncedMint: Boolean(meta.renouncedMint ?? false),
@@ -1279,7 +1283,9 @@ async function fetchSeeds(settings: GmgnSettings): Promise<GmgnSignalCandidate[]
     })
     .filter(shouldProcessSeed);
 
-  return sortAndLimitSeeds(scored, settings.maxCandidatesPerPoll);
+  const result = sortAndLimitSeeds(scored, settings.maxCandidatesPerPoll);
+  logger.debug({ rawSeeds: seeds.length, afterFilter: scored.length, returned: result.length }, "[gmgn-source] fetchSeeds cycle");
+  return result;
 }
 
 type DeepDiveResult =
@@ -1352,7 +1358,7 @@ async function deepDiveCandidate(seed: GmgnSignalCandidate): Promise<DeepDiveRes
         stat.top_10_holder_rate ??
         0,
     );
-    if (t10 > 0) next.top10Pct = maybeRatioPct(t10);
+    if (t10 > 0) next.top10Pct = maybeRatioPct(t10, "top10Pct");
   }
 
   // bundler_rate → bundlerPct (only if missing)
@@ -1363,7 +1369,7 @@ async function deepDiveCandidate(seed: GmgnSignalCandidate): Promise<DeepDiveRes
         stat.bot_degen_rate ??
         0,
     );
-    if (b > 0) next.bundlerPct = maybeRatioPct(b);
+    if (b > 0) next.bundlerPct = maybeRatioPct(b, "bundlerPct");
   }
 
   // is_wash_trading → isWashTrading (only if not set)

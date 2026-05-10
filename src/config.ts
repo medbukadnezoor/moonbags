@@ -1,6 +1,8 @@
 import dotenv from "dotenv";
 import fs from "fs";
 import path from "path";
+import { assertLabRuntimeDryRun, validateRuntimeSettings } from "./safetyImmutables.js";
+import logger from "./logger.js";
 
 dotenv.config();
 
@@ -50,6 +52,7 @@ function resolveRpcUrl(): string {
   return raw.replace("${HELIUS_API_KEY}", helius);
 }
 
+assertLabRuntimeDryRun(process.env.DRY_RUN);
 const DRY_RUN = bool("DRY_RUN", true);
 
 const LLM_ENDPOINT = str("LLM_ENDPOINT") ?? "https://api.minimax.io/v1/chat/completions";
@@ -327,12 +330,17 @@ function loadRuntimeFlags(): void {
     const raw = fs.readFileSync(RUNTIME_FLAGS_PATH, "utf8");
     const obj = JSON.parse(raw) as Record<string, unknown>;
     for (const key of PERSISTED_FLAGS) {
-      if (typeof obj[key] === "boolean") {
+      const spec = SETTABLE_SPECS[key];
+      if (spec.type === "boolean" && typeof obj[key] === "boolean") {
+        (CONFIG as unknown as Record<string, unknown>)[key] = obj[key];
+      } else if (spec.type === "number" && typeof obj[key] === "number" && Number.isFinite(obj[key] as number)) {
         (CONFIG as unknown as Record<string, unknown>)[key] = obj[key];
       }
     }
-  } catch {
-    // File missing or corrupt — use env/default values.
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      logger.warn({ err: String(err) }, "[config] loadRuntimeFlags failed — using env/default values");
+    }
   }
 }
 
@@ -343,8 +351,8 @@ function saveRuntimeFlags(): void {
       obj[key] = (CONFIG as unknown as Record<string, unknown>)[key];
     }
     fs.writeFileSync(RUNTIME_FLAGS_PATH, JSON.stringify(obj, null, 2));
-  } catch {
-    // Non-fatal.
+  } catch (err) {
+    logger.warn({ err: String(err) }, "[config] saveRuntimeFlags failed — toggle changes not persisted");
   }
 }
 
@@ -370,6 +378,8 @@ export function setConfigValue(key: SettableKey, raw: string): SetConfigResult {
   }
   const err = spec.validate(parsed);
   if (err) return { ok: false, error: err };
+  const safety = validateRuntimeSettings({ [key]: parsed });
+  if (!safety.ok) return { ok: false, error: safety.errors.join(" ") };
 
   // mutate in-memory CONFIG (typed as readonly but the object isn't frozen anymore)
   (CONFIG as unknown as Record<string, unknown>)[key] = parsed;
