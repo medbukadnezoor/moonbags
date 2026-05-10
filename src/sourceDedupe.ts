@@ -1,5 +1,6 @@
 import fs from "fs";
 import path from "path";
+import logger from "./logger.js";
 
 const STATE_PATH = path.resolve("state/dedupeState.json");
 // Prune entries older than 24h on load — no cooldown is that long.
@@ -16,8 +17,10 @@ function loadFromDisk(): void {
     for (const [mint, entry] of Object.entries(obj)) {
       if (entry.at > cutoff) acceptedByMint.set(mint, entry);
     }
-  } catch {
-    // File missing or corrupt — start fresh.
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      logger.warn({ err: String(err) }, "[source-dedupe] loadFromDisk failed, starting fresh");
+    }
   }
 }
 
@@ -26,8 +29,8 @@ function saveToDisk(): void {
     const obj: Record<string, Entry> = {};
     for (const [mint, entry] of acceptedByMint) obj[mint] = entry;
     fs.writeFileSync(STATE_PATH, JSON.stringify(obj, null, 2));
-  } catch {
-    // Non-fatal — worst case cooldown is lost on next restart.
+  } catch (err) {
+    logger.warn({ err: String(err) }, "[source-dedupe] saveToDisk failed — cooldown state not persisted");
   }
 }
 

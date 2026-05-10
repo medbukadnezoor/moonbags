@@ -904,7 +904,9 @@ async function fetchSeeds(settings: OkxDiscoverySettings): Promise<OkxDiscoveryC
   // Filter-dedupe ONLY inside fetchSeeds — processSeed no longer re-applies
   // shouldProcessSeed (the GMGN double-dedupe bug we just fixed).
   const deduped = seeds.filter(shouldProcessSeed);
-  return sortAndLimitSeeds(deduped, settings.maxCandidatesPerPoll);
+  const result = sortAndLimitSeeds(deduped, settings.maxCandidatesPerPoll);
+  logger.debug({ rawSeeds: seeds.length, afterFilter: deduped.length, returned: result.length }, "[okx-discovery] fetchSeeds cycle");
+  return result;
 }
 
 // ---------------------------------------------------------------------------

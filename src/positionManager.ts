@@ -70,7 +70,11 @@ async function appendClosedTrade(t: ClosedTrade): Promise<void> {
       try {
         const raw = await readFile(CLOSED_LOG, "utf8");
         all = JSON.parse(raw) as ClosedTrade[];
-      } catch { /* first write */ }
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+          logger.warn({ err: String(err) }, "[closed-log] read failed, starting fresh");
+        }
+      }
       all.push(t);
       // keep only most recent 500 trades
       if (all.length > 500) all = all.slice(-500);
@@ -87,7 +91,10 @@ export async function getClosedTrades(limit = 100): Promise<ClosedTrade[]> {
     const raw = await readFile(CLOSED_LOG, "utf8");
     const all = JSON.parse(raw) as ClosedTrade[];
     return all.slice(-limit).reverse();
-  } catch {
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      logger.warn({ err: String(err) }, "[closed-log] getClosedTrades read failed");
+    }
     return [];
   }
 }
@@ -344,7 +351,11 @@ async function recordStranded(record: Record<string, unknown>): Promise<void> {
     try {
       const raw = await readFile(STRANDED_LOG, "utf8");
       all = JSON.parse(raw) as Record<string, unknown>[];
-    } catch { /* first write */ }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        logger.warn({ err: String(err) }, "[stranded-log] read failed, starting fresh");
+      }
+    }
     all.push({ recordedAt: Date.now(), ...record });
     await writeFile(STRANDED_LOG, JSON.stringify(all, null, 2));
   } catch (err) {
@@ -458,6 +469,7 @@ export async function openPosition(alert: ScgAlert): Promise<Position | null> {
 
   const existing = positions.get(alert.mint);
   if (existing) {
+    logger.debug({ mint: alert.mint, status: existing.status }, "[open] duplicate mint — returning existing position");
     return existing;
   }
 
@@ -497,10 +509,13 @@ export async function openPosition(alert: ScgAlert): Promise<Position | null> {
   const quote = await getPriceViaSellQuote(alert.mint, tokensReceivedRaw).catch(() => null);
   if (quote && tokensReceivedRaw > 0n) {
     entryPricePerTokenSol = Number(quote.solReceivedLamports) / 1e9 / (Number(tokensReceivedRaw) / Math.pow(10, tokenDecimals));
+    logger.debug({ mint: alert.mint, source: "sell-quote", entryPricePerTokenSol }, "[open] entry price from sell-quote");
   } else if (tokensReceivedRaw > 0n) {
     entryPricePerTokenSol = (Number(solLamports) / 1e9) / (Number(tokensReceivedRaw) / Math.pow(10, tokenDecimals));
+    logger.debug({ mint: alert.mint, source: "buy-amount", entryPricePerTokenSol }, "[open] entry price from buy-amount (sell-quote unavailable)");
   } else {
     entryPricePerTokenSol = 0;
+    logger.warn({ mint: alert.mint }, "[open] entry price is 0 — both sell-quote and buy-amount failed");
   }
 
   const position: Position = {
@@ -569,7 +584,10 @@ export async function tickPositions(): Promise<void> {
   const mints = openPositions.map((p) => p.mint);
   const batchMints = Array.from(new Set([...mints, SOL_MINT]));
 
-  const priceMap = await getBatchPricesParallel(batchMints).catch(() => new Map<string, number>());
+  const priceMap = await getBatchPricesParallel(batchMints).catch((err) => {
+    logger.warn({ err: String(err), mintCount: batchMints.length }, "[tick] getBatchPricesParallel failed — returning empty price map");
+    return new Map<string, number>();
+  });
   const solUsdPrice = priceMap.get(SOL_MINT);
 
   await Promise.all(
@@ -579,6 +597,7 @@ export async function tickPositions(): Promise<void> {
       }),
     ),
   );
+  logger.debug({ ticked: openPositions.length, priceMapSize: priceMap.size }, "[tick] tickPositions cycle complete");
 }
 
 async function tickOne(
@@ -591,11 +610,13 @@ async function tickOne(
   const tokenUsdPrice = priceMap.get(position.mint);
   if (tokenUsdPrice && solUsdPrice && solUsdPrice > 0) {
     currentPriceSol = tokenUsdPrice / solUsdPrice;
+    logger.debug({ mint: position.mint, source: "batch", tokenUsdPrice, solUsdPrice }, "[tick] price from batch");
   } else {
     // fallback: on-chain sell quote — slower but always accurate
     const quote = await getPriceViaSellQuote(position.mint, position.tokensHeld).catch(() => null);
     if (quote) {
       currentPriceSol = (quote.solPerTokenRaw * Math.pow(10, position.tokenDecimals)) / 1e9;
+      logger.debug({ mint: position.mint, source: "sell-quote", currentPriceSol }, "[tick] price from sell-quote fallback");
     }
   }
 
@@ -627,6 +648,7 @@ async function tickOne(
 
     if (mbReason) {
       if (position.lastSellAttemptAt && Date.now() - position.lastSellAttemptAt < SELL_RETRY_COOLDOWN_MS) {
+        logger.debug({ mint: position.mint, mbReason, cooldownRemainingMs: SELL_RETRY_COOLDOWN_MS - (Date.now() - position.lastSellAttemptAt) }, "[moonbag] exit suppressed — within sell retry cooldown");
         position.lastTickAt = Date.now();
         return;
       }
@@ -642,6 +664,7 @@ async function tickOne(
 
   const entry = position.entryPricePerTokenSol;
   if (entry <= 0) {
+    logger.warn({ mint: position.mint, entry }, "[tick] entry price is zero or negative — skipping tick (data integrity issue)");
     position.lastTickAt = Date.now();
     return;
   }
@@ -721,6 +744,7 @@ async function tickOne(
   }
 
   if (reason && position.lastSellAttemptAt && Date.now() - position.lastSellAttemptAt < SELL_RETRY_COOLDOWN_MS) {
+    logger.debug({ mint: position.mint, reason, cooldownRemainingMs: SELL_RETRY_COOLDOWN_MS - (Date.now() - position.lastSellAttemptAt) }, "[tick] exit suppressed — within sell retry cooldown");
     position.lastTickAt = Date.now();
     return;
   }
@@ -822,6 +846,7 @@ async function partialSellForTakeProfit(
 
   const walletBalance = await getSellableTokenBalance(position);
   if (walletBalance === 0n) {
+    logger.warn({ mint }, "[sell] wallet balance is zero — position likely manually sold, marking closed");
     position.status = "closed";
     position.exitReason = "manual";
     markDirty();
@@ -830,7 +855,7 @@ async function partialSellForTakeProfit(
   }
 
   const totalTokens = walletBalance ?? position.tokensHeld;
-  const sellTokens = BigInt(Math.floor(Number(totalTokens) * target.sellPct));
+  const sellTokens = totalTokens * BigInt(Math.round(target.sellPct * 10000)) / 10000n;
   const remainingTokens = totalTokens - sellTokens;
 
   if (sellTokens <= 0n || remainingTokens <= 0n) {
@@ -906,6 +931,7 @@ async function partialSellAndMoonbag(position: Position, reason: "trail" | "take
 
   const walletBalance = await getSellableTokenBalance(position);
   if (walletBalance === 0n) {
+    logger.warn({ mint }, "[sell] wallet balance is zero — position likely manually sold, marking closed");
     position.status = "closed";
     position.exitReason = "manual";
     markDirty();
@@ -913,10 +939,11 @@ async function partialSellAndMoonbag(position: Position, reason: "trail" | "take
     return;
   }
   const totalTokens = walletBalance ?? position.tokensHeld;
-  const moonbagTokens = BigInt(Math.floor(Number(totalTokens) * runner.keepPct));
+  const moonbagTokens = totalTokens * BigInt(Math.round(runner.keepPct * 10000)) / 10000n;
   const sellTokens = totalTokens - moonbagTokens;
 
   if (sellTokens <= 0n) {
+    logger.warn({ mint, keepPct: runner.keepPct, totalTokens: totalTokens.toString() }, "[moonbag] keepPct too high — nothing to sell, position stays open");
     position.status = "open";
     markDirty();
     return;
@@ -1026,6 +1053,7 @@ async function partialSellPosition(
   const walletBalance = await getSellableTokenBalance(position);
   if (walletBalance === 0n) {
     // Position tokens no longer present — treat as fully closed (manual sell).
+    logger.warn({ mint }, "[sell] wallet balance is zero — position likely manually sold, marking closed");
     position.status = "closed";
     position.exitReason = "manual";
     markDirty();
@@ -1033,7 +1061,7 @@ async function partialSellPosition(
     return;
   }
   const totalTokens = walletBalance ?? position.tokensHeld;
-  const sellTokens = BigInt(Math.floor(Number(totalTokens) * sellPct));
+  const sellTokens = totalTokens * BigInt(Math.round(sellPct * 10000)) / 10000n;
   const remainingTokens = totalTokens - sellTokens;
 
   // Guards: avoid edge cases that would leave a useless dust position
@@ -1317,7 +1345,9 @@ export async function tickLlmHeartbeat(): Promise<void> {
     const pnlPct = entry > 0 ? (current / entry - 1) * 100 : 0;
     const peakPnlPct = entry > 0 ? (peak / entry - 1) * 100 : 0;
     const trailPct = p.dynamicTrailPct ?? CONFIG.TRAIL_PCT;
-    const floorPnlPct = peakPnlPct - trailPct * 100;
+    const peakMultiple = 1 + peakPnlPct / 100;
+    const floorMultiple = peakMultiple * (1 - trailPct);
+    const floorPnlPct = (floorMultiple - 1) * 100;
     return {
       name: p.name,
       mint: p.mint,
@@ -1341,7 +1371,10 @@ async function consultOnePosition(position: Position): Promise<void> {
   const entry = position.entryPricePerTokenSol;
   const current = position.currentPricePerTokenSol;
   const peak = position.peakPricePerTokenSol;
-  if (entry <= 0 || current <= 0 || peak <= 0) return;
+  if (entry <= 0 || current <= 0 || peak <= 0) {
+    logger.warn({ mint: position.mint, entry, current, peak }, "[llm] skipping position — entry/current/peak price is zero or negative");
+    return;
+  }
 
   // One-time "LLM watching" notification when LLM first picks up an armed position.
   if (!position.llmActiveNotified) {
@@ -1403,7 +1436,10 @@ async function consultOnePosition(position: Position): Promise<void> {
   }
 
   const decision = await consultLlm(ctx, snapshot);
-  if (!decision) return;   // null = fall back to existing trail logic for this poll
+  if (!decision) {
+    logger.debug({ mint: position.mint }, "[llm] consultLlm returned null — falling back to trail logic for this poll");
+    return;
+  }   // null = fall back to existing trail logic for this poll
 
   if (decision.action === "hold") {
     logger.debug({ mint: position.mint, reason: decision.reason }, "[llm] hold");

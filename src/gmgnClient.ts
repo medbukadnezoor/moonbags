@@ -225,7 +225,8 @@ async function requestJson(pathname: string, init: GmgnRequestInit = {}, ttlMs?:
       if (rawText) {
         try {
           parsed = JSON.parse(rawText) as unknown;
-        } catch {
+        } catch (err) {
+          logger.warn({ err: String(err) }, "[gmgn] JSON parse failed — treating response as raw string");
           parsed = rawText;
         }
       } else {
